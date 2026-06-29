@@ -1,0 +1,8 @@
+[package]
+name = "suite-timeline"
+version.workspace = true
+edition.workspace = true
+description = "Generic track/keyframe/playhead engine — one spine, three faces."
+
+[dependencies]
+serde = { workspace = true }

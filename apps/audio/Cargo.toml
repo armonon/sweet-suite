@@ -1,0 +1,16 @@
+[package]
+name = "suite-audio"
+version.workspace = true
+edition.workspace = true
+description = "The DAW. A sibling binary kept process-isolated for real-time audio safety."
+
+[dependencies]
+suite-gpu = { path = "../../platform/gpu" }
+suite-ui = { path = "../../platform/ui" }
+suite-design = { path = "../../platform/design" }
+suite-input = { path = "../../platform/input" }
+suite-doc = { path = "../../platform/doc" }
+suite-timeline = { path = "../../platform/timeline" }
+suite-nodes = { path = "../../platform/nodes" }
+suite-assets = { path = "../../platform/assets" }
+suite-services = { path = "../../platform/services" }

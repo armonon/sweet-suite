@@ -1,0 +1,7 @@
+[package]
+name = "suite-design"
+version.workspace = true
+edition.workspace = true
+description = "Design tokens + the one component kit (the look)."
+
+[dependencies]

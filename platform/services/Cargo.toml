@@ -1,0 +1,7 @@
+[package]
+name = "suite-services"
+version.workspace = true
+edition.workspace = true
+description = "IO, color management, prefs, plugin host, licensing, auto-update, telemetry."
+
+[dependencies]

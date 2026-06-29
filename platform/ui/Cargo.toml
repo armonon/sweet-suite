@@ -1,0 +1,7 @@
+[package]
+name = "suite-ui"
+version.workspace = true
+edition.workspace = true
+description = "The shell: chrome, docking, panels, the contextual right panel, command palette."
+
+[dependencies]

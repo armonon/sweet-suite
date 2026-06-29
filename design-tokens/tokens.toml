@@ -1,0 +1,45 @@
+# SWEET design tokens — the single source of truth for the look.
+# Consumed by platform/design (the one component kit). Charcoal chrome + one accent.
+# See docs/02-suite-platform-architecture.md §3.2 and docs/01 (the shell).
+# This is DATA, not a crate — it is intentionally outside the Cargo workspace.
+
+[color.chrome]            # monochrome charcoal scale (0 = darkest)
+bg-0  = "#0E0F11"
+bg-1  = "#16181B"
+bg-2  = "#1E2125"
+bg-3  = "#282C31"
+line  = "#34393F"
+text-0 = "#E8EAED"        # primary text
+text-1 = "#A8AEB6"        # secondary
+text-2 = "#6B7178"        # tertiary / disabled
+
+[color.accent]            # the single accent — used sparingly, everywhere it matters
+base  = "#3B82F6"
+hover = "#5B9CF8"
+press = "#2D6FE0"
+
+[color.semantic]
+warn  = "#E2B340"
+error = "#E5534B"
+ok    = "#3FB67E"
+
+[type]
+family = "Inter, system-ui, sans-serif"
+mono   = "JetBrains Mono, ui-monospace, monospace"
+scale  = [11, 12, 13, 16, 19, 23, 28, 33]   # modular scale ~1.20, px
+weight-regular  = 400
+weight-medium   = 500
+weight-semibold = 600
+
+[space]                   # 4px base grid
+grid   = 4
+steps  = [2, 4, 8, 12, 16, 24, 32, 48, 64] # px
+radius = [3, 5, 8, 12]    # px
+
+[motion]                  # durations (ms) + easing as cubic-bezier control points
+fast = 90
+base = 140
+slow = 220
+ease-standard   = [0.2, 0.0, 0.0, 1.0]
+ease-emphasized = [0.3, 0.0, 0.0, 1.0]
+ease-exit       = [0.4, 0.0, 1.0, 1.0]

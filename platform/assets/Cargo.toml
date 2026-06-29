@@ -1,0 +1,9 @@
+[package]
+name = "suite-assets"
+version.workspace = true
+edition.workspace = true
+description = "Universal project/bundle format, shared asset library, cross-app interchange."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "suite-gpu"
+version.workspace = true
+edition.workspace = true
+description = "wgpu abstraction, the Forward+ renderer, and the compositor."
+
+[dependencies]
+wgpu = { workspace = true }
+winit = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+suite-doc = { path = "../doc" }

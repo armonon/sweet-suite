@@ -1,0 +1,2831 @@
+//! # suite-gpu — wgpu abstraction, the renderer, and the compositor.
+//!
+//! The renderer is a **pure function of scene state at one instant**:
+//! `frame = render(scene, camera, t)`. It owns no truth and mutates no document;
+//! it draws whatever the object model says is true *right now* and moves on.
+//! Forward+ (clustered), five passes, linear HDR working space, <8 ms budget. docs/03 §1.
+//!
+//! Phase 1+3 lite: the renderer reads from a `suite_doc::Document`, draws every
+//! visible object with its world matrix, and highlights the selected one. A
+//! procedural infinite grid sits behind everything. The frame graph is still a
+//! single pass — the multi-pass Forward+ graph arrives at Phase 4.
+
+#![allow(dead_code)]
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
+use suite_doc::{Document, ObjId, ObjectKind};
+use wgpu::util::DeviceExt;
+use winit::window::Window;
+
+mod compositor;
+mod raster;
+mod shaders;
+mod tile_canvas;
+
+pub use compositor::{AdjustmentEntry, CompEntry, Compositor, LayerEntry};
+pub use raster::{Brush, BrushBlend, BrushTip, RasterCanvas};
+pub use tile_canvas::{TileCanvas, CANVAS_TILES, DISPLAY_SIZE, TILE_SIZE};
+pub use suite_doc; // re-export so apps don't need a separate import
+
+/// The frame-graph passes, in order. docs/03 §1.2 (not all used yet in Phase 1+3 lite).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    ClusterBuild,
+    OpaqueZPrepassThenShade,
+    Transparent,
+    FlatComposite,
+    Overlays,
+    Post,
+}
+
+pub const PASS_ORDER: [Pass; 6] = [
+    Pass::ClusterBuild,
+    Pass::OpaqueZPrepassThenShade,
+    Pass::Transparent,
+    Pass::FlatComposite,
+    Pass::Overlays,
+    Pass::Post,
+];
+
+/// Input → on-screen in under this many ms, every frame. docs/01 §2, docs/03 §1.9.
+pub const FRAME_BUDGET_MS: f32 = 8.0;
+
+/// `design-tokens/tokens.toml`'s `color.chrome.bg-0` in linear RGB.
+const CHROME_BG0_LINEAR: [f32; 4] = [0.0033, 0.0035, 0.0040, 1.0];
+/// `color.accent.base` linearized — used as the selection highlight tint.
+const ACCENT_BASE_LINEAR: [f32; 4] = [0.0466, 0.2122, 0.7605, 1.0];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+    Perspective,
+    Orthographic,
+}
+
+impl Projection {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Perspective => Self::Orthographic,
+            Self::Orthographic => Self::Perspective,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Perspective => "perspective",
+            Self::Orthographic => "orthographic",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Camera {
+    pub projection: Projection,
+    pub target: Vec3,
+    pub distance: f32,
+    pub yaw_radians: f32,
+    pub pitch_radians: f32,
+    pub fov_y_radians: f32,
+    pub ortho_height: f32,
+    pub z_near: f32,
+    pub z_far: f32,
+}
+
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            projection: Projection::Perspective,
+            target: Vec3::ZERO,
+            distance: 6.0,
+            yaw_radians: std::f32::consts::FRAC_PI_4,
+            pitch_radians: -std::f32::consts::FRAC_PI_6,
+            fov_y_radians: std::f32::consts::FRAC_PI_4,
+            ortho_height: 5.0,
+            z_near: 0.1,
+            z_far: 100.0,
+        }
+    }
+}
+
+impl Camera {
+    pub fn eye(&self) -> Vec3 {
+        let cp = self.pitch_radians.cos();
+        let sp = self.pitch_radians.sin();
+        let cy = self.yaw_radians.cos();
+        let sy = self.yaw_radians.sin();
+        self.target
+            + Vec3::new(
+                self.distance * cp * sy,
+                self.distance * sp,
+                self.distance * cp * cy,
+            )
+    }
+    pub fn view(&self) -> Mat4 {
+        Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
+    }
+    pub fn proj(&self, aspect: f32) -> Mat4 {
+        match self.projection {
+            Projection::Perspective => {
+                Mat4::perspective_rh(self.fov_y_radians, aspect, self.z_near, self.z_far)
+            }
+            Projection::Orthographic => {
+                let h = self.ortho_height * 0.5;
+                let w = h * aspect;
+                Mat4::orthographic_rh(-w, w, -h, h, self.z_near, self.z_far)
+            }
+        }
+    }
+    /// World-space ray for a normalized cursor (in 0..1, top-left origin) — used by
+    /// the picker (suite_doc::ray_aabb_world).
+    pub fn ray_from_cursor(
+        &self,
+        cursor_x_norm: f32,
+        cursor_y_norm: f32,
+        aspect: f32,
+    ) -> (Vec3, Vec3) {
+        let ndc_x = cursor_x_norm * 2.0 - 1.0;
+        let ndc_y = 1.0 - cursor_y_norm * 2.0;
+        let view_proj = self.proj(aspect) * self.view();
+        let inv = view_proj.inverse();
+        let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.0));
+        let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        let dir = (far - near).normalize_or_zero();
+        (near, dir)
+    }
+    /// Gizmo scale that stays roughly screen-constant as the camera moves. Returns the
+    /// world-space length the gizmo arms should be so they always project to a similar
+    /// size in pixels. Tuned for a 1280×800 default window; refine when measuring
+    /// real screen sizes (Phase 1 polish vs. a real `platform/input::Gizmo`).
+    pub fn gizmo_world_scale(&self, world_pos: Vec3) -> f32 {
+        match self.projection {
+            Projection::Perspective => {
+                let d = (self.eye() - world_pos).length().max(0.1);
+                d * 0.18
+            }
+            Projection::Orthographic => self.ortho_height * 0.18,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GizmoAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl GizmoAxis {
+    pub fn unit(self) -> Vec3 {
+        match self {
+            Self::X => Vec3::X,
+            Self::Y => Vec3::Y,
+            Self::Z => Vec3::Z,
+        }
+    }
+}
+
+/// Whole-layer pixel transforms (M4). Applied as a single undoable edit on the active
+/// layer's canvas. The paint canvas is square, so 90° rotations preserve dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerTransform {
+    FlipH,
+    FlipV,
+    Rotate90Cw,
+    Rotate90Ccw,
+    Rotate180,
+}
+
+// sRGB <-> linear transfer (the paint texture is `Rgba8UnormSrgb`, so direct CPU pixel
+// edits must encode/decode to composite correctly in linear space).
+#[inline]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+#[inline]
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// **Pure** gradient fill over an RGBA8 (sRGB-encoded) buffer. Interpolates `color_a`→
+/// `color_b` (linear RGBA) along the from→to vector (`radial=false`) or radially from
+/// `from_uv` (`radial=true`), then source-over composites in linear space. `selection`
+/// (UV `[x0,y0,x1,y1]`) clips the affected region. Endpoints are in UV (0..1). Extracted
+/// from the GPU method so the math is unit-testable without a window/device.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gradient_fill(
+    pixels: &mut [u8],
+    size: usize,
+    from_uv: [f32; 2],
+    to_uv: [f32; 2],
+    color_a: [f32; 4],
+    color_b: [f32; 4],
+    radial: bool,
+    selection: Option<[f32; 4]>,
+) {
+    let (sx0, sy0, sx1, sy1) = match selection {
+        Some([x0, y0, x1, y1]) if x1 > x0 && y1 > y0 => (
+            (x0 * size as f32).floor().max(0.0) as usize,
+            (y0 * size as f32).floor().max(0.0) as usize,
+            (x1 * size as f32).ceil().min(size as f32) as usize,
+            (y1 * size as f32).ceil().min(size as f32) as usize,
+        ),
+        _ => (0, 0, size, size),
+    };
+
+    let fx = from_uv[0] * size as f32;
+    let fy = from_uv[1] * size as f32;
+    let dx = (to_uv[0] - from_uv[0]) * size as f32;
+    let dy = (to_uv[1] - from_uv[1]) * size as f32;
+    let len2 = (dx * dx + dy * dy).max(1e-6);
+    let radius = len2.sqrt().max(1e-6);
+
+    for y in sy0..sy1 {
+        for x in sx0..sx1 {
+            let pxf = x as f32 + 0.5;
+            let pyf = y as f32 + 0.5;
+            let t = if radial {
+                (((pxf - fx).powi(2) + (pyf - fy).powi(2)).sqrt() / radius).clamp(0.0, 1.0)
+            } else {
+                (((pxf - fx) * dx + (pyf - fy) * dy) / len2).clamp(0.0, 1.0)
+            };
+            let sr = color_a[0] + (color_b[0] - color_a[0]) * t;
+            let sg = color_a[1] + (color_b[1] - color_a[1]) * t;
+            let sb = color_a[2] + (color_b[2] - color_a[2]) * t;
+            let sa = color_a[3] + (color_b[3] - color_a[3]) * t;
+            if sa <= 0.0 {
+                continue;
+            }
+            let idx = (y * size + x) * 4;
+            let dr = srgb_to_linear(pixels[idx] as f32 / 255.0);
+            let dg = srgb_to_linear(pixels[idx + 1] as f32 / 255.0);
+            let db = srgb_to_linear(pixels[idx + 2] as f32 / 255.0);
+            let da = pixels[idx + 3] as f32 / 255.0;
+            let oa = sa + da * (1.0 - sa);
+            let (or, og, ob) = if oa > 1e-6 {
+                (
+                    (sr * sa + dr * da * (1.0 - sa)) / oa,
+                    (sg * sa + dg * da * (1.0 - sa)) / oa,
+                    (sb * sa + db * da * (1.0 - sa)) / oa,
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            pixels[idx] = (linear_to_srgb(or).clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixels[idx + 1] = (linear_to_srgb(og).clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixels[idx + 2] = (linear_to_srgb(ob).clamp(0.0, 1.0) * 255.0).round() as u8;
+            pixels[idx + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+}
+
+/// **Pure** whole-canvas flip/rotate of a square RGBA8 buffer. Returns the transformed
+/// buffer (same length). `size` is the side length in texels.
+pub fn apply_layer_transform(src: &[u8], size: usize, op: LayerTransform) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    for y in 0..size {
+        for x in 0..size {
+            let (nx, ny) = match op {
+                LayerTransform::FlipH => (size - 1 - x, y),
+                LayerTransform::FlipV => (x, size - 1 - y),
+                LayerTransform::Rotate90Cw => (size - 1 - y, x),
+                LayerTransform::Rotate90Ccw => (y, size - 1 - x),
+                LayerTransform::Rotate180 => (size - 1 - x, size - 1 - y),
+            };
+            let si = (y * size + x) * 4;
+            let di = (ny * size + nx) * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    dst
+}
+
+/// Drives the translate-gizmo draw. The renderer reads this once per frame; nothing is
+/// retained across frames.
+#[derive(Clone, Copy, Debug)]
+pub struct GizmoOverlay {
+    pub origin: Vec3,
+    pub world_scale: f32,
+    pub highlighted: Option<GizmoAxis>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    proj_kind_and_pad: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Vertex {
+    position: [f32; 3],
+    _pad0: f32,
+    color: [f32; 4],
+}
+
+/// Vertex for editable Mesh objects with a per-mesh paint texture.
+/// Box-projected UV is computed per-triangle in `tessellate_mesh_painted`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshVertex {
+    position: [f32; 3],
+    _pad0: f32,
+    color: [f32; 4],
+    uv: [f32; 2],
+    _pad1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+struct ObjectUniform {
+    model: [[f32; 4]; 4],
+    color: [f32; 4],
+    selected_pad: [f32; 4], // x: 0.0 = unselected, 1.0 = selected; rest reserved
+}
+
+/// 256-byte aligned object uniform slot. Matches the minimum uniform-buffer offset
+/// alignment on all wgpu targets so we can use dynamic offset addressing.
+const OBJECT_SLOT_BYTES: u64 = 256;
+
+pub struct FrameBudget {
+    last_overrun_log: Instant,
+    pub last_frame_ms: f32,
+    pub peak_frame_ms: f32,
+    pub frames: u64,
+}
+
+impl Default for FrameBudget {
+    fn default() -> Self {
+        Self {
+            last_overrun_log: Instant::now(),
+            last_frame_ms: 0.0,
+            peak_frame_ms: 0.0,
+            frames: 0,
+        }
+    }
+}
+
+impl FrameBudget {
+    pub fn record(&mut self, elapsed_ms: f32) {
+        self.last_frame_ms = elapsed_ms;
+        if elapsed_ms > self.peak_frame_ms {
+            self.peak_frame_ms = elapsed_ms;
+        }
+        self.frames += 1;
+        if elapsed_ms > FRAME_BUDGET_MS && self.last_overrun_log.elapsed().as_secs() >= 1 {
+            eprintln!(
+                "frame budget overrun: {:.2} ms > {:.2} ms (peak {:.2} ms over {} frames)",
+                elapsed_ms, FRAME_BUDGET_MS, self.peak_frame_ms, self.frames
+            );
+            self.last_overrun_log = Instant::now();
+        }
+    }
+}
+
+struct SurfaceState {
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    depth_view: wgpu::TextureView,
+}
+
+struct MeshAsset {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
+/// One layer in the 2D paint stack: its own paintable texture + compositing metadata.
+struct PaintLayer {
+    canvas: RasterCanvas,
+    name: String,
+    visible: bool,
+    opacity: f32,
+    blend: suite_doc::BlendMode,
+}
+
+/// Read-only snapshot of a layer's metadata for the UI (the panel can't touch the GPU).
+#[derive(Clone, Debug)]
+pub struct LayerInfo {
+    pub name: String,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend: suite_doc::BlendMode,
+}
+
+/// Map a blend mode to the shader's `mode` id (matches LAYER_COMPOSITE_WGSL's switch).
+fn blend_mode_u32(m: suite_doc::BlendMode) -> u32 {
+    use suite_doc::BlendMode::*;
+    match m {
+        Normal => 0,
+        Multiply => 1,
+        Screen => 2,
+        Overlay => 3,
+        SoftLight => 4,
+        HardLight => 5,
+        Add => 6,
+        Subtract => 7,
+    }
+}
+
+/// A layer's pixels + metadata, for loading a saved project into the stack.
+#[derive(Clone, Debug)]
+pub struct LoadedLayer {
+    pub rgba: Vec<u8>,
+    pub name: String,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend: suite_doc::BlendMode,
+}
+
+/// Composites one layer (`src`) over the running result (`base`) with a blend mode +
+/// opacity, writing the Porter-Duff "over" result. Mirrors the compositor's blend math so
+/// 2D layers and adjustment layers behave identically. UV uses the top-left-origin
+/// convention (1:1 with the brush/texture layout).
+const LAYER_COMPOSITE_WGSL: &str = r#"
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex
+fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+    var out: VsOut;
+    let x = select(-1.0, 1.0, (vi & 1u) != 0u);
+    let y = select(-1.0, 1.0, (vi & 2u) != 0u);
+    out.pos = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv  = vec2<f32>(x * 0.5 + 0.5, 0.5 - y * 0.5);
+    return out;
+}
+@group(0) @binding(0) var base_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_tex:  texture_2d<f32>;
+@group(0) @binding(2) var samp:     sampler;
+struct BlendParams { mode: u32, opacity: f32, _p0: u32, _p1: u32 }
+@group(0) @binding(3) var<uniform> params: BlendParams;
+
+fn overlay_ch(b: f32, s: f32) -> f32 {
+    if b < 0.5 { return 2.0 * b * s; }
+    return 1.0 - 2.0 * (1.0 - b) * (1.0 - s);
+}
+fn hard_light_ch(b: f32, s: f32) -> f32 { return overlay_ch(s, b); }
+fn soft_light_ch(b: f32, s: f32) -> f32 {
+    if s < 0.5 { return b - (1.0 - 2.0 * s) * b * (1.0 - b); }
+    var d: f32;
+    if b < 0.25 { d = ((16.0 * b - 12.0) * b + 4.0) * b; }
+    else        { d = sqrt(b); }
+    return b + (2.0 * s - 1.0) * (d - b);
+}
+
+@fragment
+fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    let base = textureSample(base_tex, samp, in.uv);
+    let src  = textureSample(src_tex,  samp, in.uv);
+    var rgb: vec3<f32>;
+    switch params.mode {
+        case 1u { rgb = base.rgb * src.rgb; }
+        case 2u { rgb = 1.0 - (1.0 - base.rgb) * (1.0 - src.rgb); }
+        case 3u { rgb = vec3(overlay_ch(base.r, src.r), overlay_ch(base.g, src.g), overlay_ch(base.b, src.b)); }
+        case 4u { rgb = vec3(soft_light_ch(base.r, src.r), soft_light_ch(base.g, src.g), soft_light_ch(base.b, src.b)); }
+        case 5u { rgb = vec3(hard_light_ch(base.r, src.r), hard_light_ch(base.g, src.g), hard_light_ch(base.b, src.b)); }
+        case 6u { rgb = clamp(base.rgb + src.rgb, vec3(0.0), vec3(1.0)); }
+        case 7u { rgb = clamp(base.rgb - src.rgb, vec3(0.0), vec3(1.0)); }
+        default { rgb = src.rgb; }
+    }
+    let sa = src.a * params.opacity;
+    let out_a = sa + base.a * (1.0 - sa);
+    let out_rgb = select(
+        (rgb * sa + base.rgb * base.a * (1.0 - sa)) / out_a,
+        vec3(0.0),
+        out_a < 0.0001
+    );
+    return vec4<f32>(out_rgb, out_a);
+}
+"#;
+
+pub struct Renderer {
+    window: Arc<Window>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface_state: SurfaceState,
+    surface_format: wgpu::TextureFormat,
+
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+
+    object_uniform_buffer: wgpu::Buffer,
+    object_bind_group: wgpu::BindGroup,
+    object_slots: u32,
+
+    quad_bind_group: wgpu::BindGroup,
+
+    /// Flattened display cache: the visible composite of `layers`. `PaintCanvas` objects
+    /// sample this. Painting goes to `layers[active_layer]`, then `composite_layers` blits
+    /// the stack into here (bottom→top).
+    raster: RasterCanvas,
+    paint_bind_group: wgpu::BindGroup,
+    /// The 2D layer stack (bottom = index 0). The brush, undo, import, etc. target
+    /// `layers[active_layer]`.
+    layers: Vec<PaintLayer>,
+    active_layer: usize,
+    /// Set when a layer's pixels/metadata change; `render` recomposites before drawing.
+    layers_dirty: bool,
+    /// Blends one layer (src) over the running composite (base) with its blend mode +
+    /// opacity, ping-ponging between `comp_a`/`comp_b`. docs/03 §1.7.
+    layer_composite_pipeline: wgpu::RenderPipeline,
+    layer_composite_layout: wgpu::BindGroupLayout,
+    comp_a: wgpu::Texture,
+    comp_a_view: wgpu::TextureView,
+    comp_b: wgpu::Texture,
+    comp_b_view: wgpu::TextureView,
+
+    /// Per-mesh paint textures (paint-on-3D). Created lazily on first brush stroke.
+    mesh_textures: std::collections::HashMap<suite_doc::ObjId, (RasterCanvas, wgpu::BindGroup)>,
+    /// Sampler shared by all mesh paint textures.
+    paint_sampler: wgpu::Sampler,
+    /// Bind-group layout for texture + sampler, stored so we can build mesh-paint BGs.
+    texture_bgl: wgpu::BindGroupLayout,
+
+    scene_pipeline: wgpu::RenderPipeline,
+    quad_pipeline: wgpu::RenderPipeline,
+    grid_pipeline: wgpu::RenderPipeline,
+    outline_pipeline: wgpu::RenderPipeline,
+    /// Pipeline for Mesh objects that have a per-mesh paint texture.
+    mesh_paint_pipeline: wgpu::RenderPipeline,
+    /// Pipeline layout for mesh_paint (camera + object + texture).
+    mesh_paint_layout: wgpu::PipelineLayout,
+
+    cube_mesh: MeshAsset,
+    sphere_mesh: MeshAsset,
+    plane_mesh: MeshAsset,
+
+    pub camera: Camera,
+    pub budget: FrameBudget,
+    /// World-space position of the magnetic snap indicator (drawn as a small bright sphere).
+    /// Set by the app while a snapped drag is active; cleared when not snapping.
+    pub snap_indicator: Option<[f32; 3]>,
+    /// World-space bone segments `(head, tail)` for the selected object's skeleton.
+    /// Drawn as bright lines with a joint cross at each head. Empty = no rig shown.
+    pub skeleton_segments: Vec<([f32; 3], [f32; 3])>,
+    /// Active selection rectangle in UV space `[x0, y0, x1, y1]` (0..1, top-left origin).
+    /// When `Some`, brush stamps are clipped to this region via a GPU scissor rect. Set by
+    /// the app from `InputState::select_rect`; `None` means "paint anywhere" (no selection).
+    pub selection_rect: Option<[f32; 4]>,
+}
+
+impl Renderer {
+    pub fn new(window: Arc<Window>) -> Self {
+        pollster::block_on(Self::new_async(window))
+    }
+
+    async fn new_async(window: Arc<Window>) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create surface");
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("request adapter");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("suite-gpu device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits()),
+                experimental_features: Default::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .expect("request device");
+
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        let caps = surface.get_capabilities(&adapter);
+        let surface_format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .unwrap_or(caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: surface_format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+        let depth_view = create_depth_view(&device, width, height);
+
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("camera bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<CameraUniform>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera uniform buffer"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &camera_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Per-object uniform — a single big buffer sliced into 256-byte chunks. Each
+        // draw binds it with the dynamic offset of the object's slot.
+        let object_slots: u32 = 256;
+        let object_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("object bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(
+                        std::mem::size_of::<ObjectUniform>() as u64
+                    ),
+                },
+                count: None,
+            }],
+        });
+        let object_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("object uniform buffer"),
+            size: OBJECT_SLOT_BYTES * object_slots as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let object_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("object bind group"),
+            layout: &object_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &object_uniform_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(std::mem::size_of::<ObjectUniform>() as u64),
+                }),
+            }],
+        });
+
+        // Image-plane checker texture, bound by both the image-plane pipeline and the
+        // standalone textured-quad pipeline (kept around as an example).
+        let (checker_texture, checker_view, checker_sampler) =
+            build_checker_texture(&device, &queue);
+        let texture_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("texture bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let quad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("textured quad bind group"),
+            layout: &texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&checker_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&checker_sampler),
+                },
+            ],
+        });
+        drop(checker_texture);
+
+        // The raster paint substrate + a bind group so PaintCanvas objects sample it.
+        let mut raster = RasterCanvas::new(&device, 1536, [0.97, 0.96, 0.94, 1.0]);
+        let paint_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("paint/mesh sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let paint_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint bind group"),
+            layout: &texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(raster.texture_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&paint_sampler),
+                },
+            ],
+        });
+        // The 2D layer stack starts with one opaque paper layer (the "Background"). Upper
+        // layers, added later, start transparent so they composite over what's below.
+        let mut background = RasterCanvas::new(&device, 1536, [0.97, 0.96, 0.94, 1.0]);
+        // Paint both the display cache and the background layer to paper up-front so they
+        // aren't undefined memory.
+        {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint init clear"),
+            });
+            raster.clear(&mut enc);
+            background.clear(&mut enc);
+            queue.submit(Some(enc.finish()));
+        }
+        let layers = vec![PaintLayer {
+            canvas: background,
+            name: "Background".to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend: suite_doc::BlendMode::Normal,
+        }];
+
+        // Layer-composite pipeline: blends one layer (src) over the running composite
+        // (base) with its blend mode + opacity (Porter-Duff over). Ping-pongs comp_a/comp_b.
+        let comp_desc = |label| wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: 1536, height: 1536, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        };
+        let comp_a = device.create_texture(&comp_desc("layer comp a"));
+        let comp_b = device.create_texture(&comp_desc("layer comp b"));
+        let comp_a_view = comp_a.create_view(&Default::default());
+        let comp_b_view = comp_b.create_view(&Default::default());
+
+        let layer_composite_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("layer composite layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let layer_composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("layer composite shader"),
+            source: wgpu::ShaderSource::Wgsl(LAYER_COMPOSITE_WGSL.into()),
+        });
+        let layer_composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("layer composite pl"),
+            bind_group_layouts: &[Some(&layer_composite_layout)],
+            immediate_size: 0,
+        });
+        let layer_composite_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("layer composite pipeline"),
+                layout: Some(&layer_composite_pl),
+                vertex: wgpu::VertexState {
+                    module: &layer_composite_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &layer_composite_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: None, // shader writes the final Porter-Duff result directly
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let cube_mesh = build_mesh(&device, &cube_vertices());
+        let sphere_mesh = build_mesh(&device, &uv_sphere_vertices(24, 16));
+        let plane_mesh = build_mesh(&device, &plane_vertices());
+
+        let depth_format = wgpu::TextureFormat::Depth32Float;
+
+        let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&object_bgl)],
+            immediate_size: 0,
+        });
+        let quad_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("textured quad pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&object_bgl), Some(&texture_bgl)],
+            immediate_size: 0,
+        });
+        let mesh_paint_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh paint pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bgl), Some(&object_bgl), Some(&texture_bgl)],
+            immediate_size: 0,
+        });
+
+        let scene_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scene shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::SCENE_WGSL.into()),
+        });
+        let grid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grid shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::GRID_WGSL.into()),
+        });
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("textured quad shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::TEXTURED_QUAD_WGSL.into()),
+        });
+        let outline_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("outline shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::OUTLINE_WGSL.into()),
+        });
+
+        let scene_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
+
+        let scene_pipeline = make_render_pipeline(
+            &device,
+            &scene_layout,
+            &scene_shader,
+            "vs_main",
+            "fs_main",
+            &[scene_vertex_layout.clone()],
+            surface_format,
+            Some(depth_format),
+            Some(wgpu::Face::Back),
+            wgpu::PrimitiveTopology::TriangleList,
+            true,
+            wgpu::CompareFunction::Less,
+        );
+        let quad_pipeline = make_render_pipeline(
+            &device,
+            &quad_layout,
+            &quad_shader,
+            "vs_main",
+            "fs_main",
+            &[scene_vertex_layout.clone()],
+            surface_format,
+            Some(depth_format),
+            None,
+            wgpu::PrimitiveTopology::TriangleList,
+            true,
+            wgpu::CompareFunction::Less,
+        );
+        let grid_pipeline = make_render_pipeline_no_vbo(
+            &device,
+            &scene_layout,
+            &grid_shader,
+            surface_format,
+            Some(depth_format),
+        );
+        let outline_pipeline = make_render_pipeline(
+            &device,
+            &scene_layout,
+            &outline_shader,
+            "vs_main",
+            "fs_main",
+            &[scene_vertex_layout],
+            surface_format,
+            Some(depth_format),
+            None,
+            wgpu::PrimitiveTopology::LineList,
+            false,
+            wgpu::CompareFunction::LessEqual,
+        );
+
+        let mesh_paint_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mesh paint shader"),
+            source: wgpu::ShaderSource::Wgsl(shaders::MESH_PAINT_WGSL.into()),
+        });
+        let mesh_paint_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: 16,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: 32,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        };
+        let mesh_paint_pipeline = make_render_pipeline(
+            &device,
+            &mesh_paint_layout,
+            &mesh_paint_shader,
+            "vs_main",
+            "fs_main",
+            &[mesh_paint_vertex_layout],
+            surface_format,
+            Some(depth_format),
+            Some(wgpu::Face::Back),
+            wgpu::PrimitiveTopology::TriangleList,
+            true,
+            wgpu::CompareFunction::Less,
+        );
+
+        Self {
+            window,
+            device,
+            queue,
+            surface_state: SurfaceState {
+                surface,
+                config,
+                depth_view,
+            },
+            surface_format,
+            camera_uniform_buffer,
+            camera_bind_group,
+            object_uniform_buffer,
+            object_bind_group,
+            object_slots,
+            quad_bind_group,
+            raster,
+            paint_bind_group,
+            layers,
+            active_layer: 0,
+            layers_dirty: true,
+            layer_composite_pipeline,
+            layer_composite_layout,
+            comp_a,
+            comp_a_view,
+            comp_b,
+            comp_b_view,
+            mesh_textures: std::collections::HashMap::new(),
+            paint_sampler,
+            texture_bgl,
+            scene_pipeline,
+            quad_pipeline,
+            grid_pipeline,
+            outline_pipeline,
+            mesh_paint_pipeline,
+            mesh_paint_layout,
+            cube_mesh,
+            sphere_mesh,
+            plane_mesh,
+            camera: Camera::default(),
+            budget: FrameBudget::default(),
+            snap_indicator: None,
+            skeleton_segments: Vec::new(),
+            selection_rect: None,
+        }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        let w = width.max(1);
+        let h = height.max(1);
+        if self.surface_state.config.width == w && self.surface_state.config.height == h {
+            return;
+        }
+        self.surface_state.config.width = w;
+        self.surface_state.config.height = h;
+        self.surface_state
+            .surface
+            .configure(&self.device, &self.surface_state.config);
+        self.surface_state.depth_view = create_depth_view(&self.device, w, h);
+    }
+
+    pub fn aspect(&self) -> f32 {
+        self.surface_state.config.width as f32 / self.surface_state.config.height.max(1) as f32
+    }
+
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_format
+    }
+    pub fn size(&self) -> (u32, u32) {
+        (
+            self.surface_state.config.width,
+            self.surface_state.config.height,
+        )
+    }
+
+    /// Convert a UV-space selection rect `[x0, y0, x1, y1]` to a texel-space scissor
+    /// `[x, y, w, h]` for `RasterCanvas::stamp_segment`. Returns `None` when the selection
+    /// is degenerate (zero area) or absent.
+    fn selection_scissor(&self, size: u32) -> Option<[u32; 4]> {
+        let [x0, y0, x1, y1] = self.selection_rect?;
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let s = size as f32;
+        let px = (x0 * s).floor() as u32;
+        let py = (y0 * s).floor() as u32;
+        let pw = ((x1 * s).ceil() as u32).saturating_sub(px).max(1);
+        let ph = ((y1 * s).ceil() as u32).saturating_sub(py).max(1);
+        Some([px, py, pw, ph])
+    }
+
+    /// Paint a brush stroke segment into the raster substrate. `from_uv`/`to_uv` are in
+    /// 0..1 canvas space (origin top-left). Records its own encoder and submits, so paint
+    /// lands immediately and independently of the frame loop. Pixels never leave the GPU.
+    /// Stamp a brush segment from `from_uv` to `to_uv`. `pressure` in [0,1] scales radius
+    /// (by sqrt) and flow linearly — 1.0 is full/mouse pressure.
+    /// When `self.selection_rect` is set, stamps are clipped to that region.
+    pub fn paint_stamp(
+        &mut self,
+        from_uv: [f32; 2],
+        to_uv: [f32; 2],
+        brush: &Brush,
+        pressure: f32,
+    ) {
+        let pressure = pressure.clamp(0.01, 1.0);
+        let effective = Brush {
+            radius_uv: brush.radius_uv * pressure.sqrt(),
+            flow: brush.flow * pressure,
+            ..*brush
+        };
+        let size = self.layers[self.active_layer].canvas.size();
+        let scissor = self.selection_scissor(size);
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint stamp enc"),
+            });
+        self.layers[self.active_layer]
+            .canvas
+            .stamp_segment(&self.device, &mut enc, from_uv, to_uv, &effective, scissor);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+    }
+
+    /// Paint a brush stroke directly onto a 3D mesh's per-mesh texture.
+    /// `from_uv` / `to_uv` are box-projected UV coordinates (computed by the caller
+    /// from the world-space hit point + face normal via `triplanar_uv`).
+    /// Creates the per-mesh `RasterCanvas` on first call (starts transparent — the
+    /// mesh-paint shader composites paint over the flat-shaded surface, so alpha 0 =
+    /// untouched surface).
+    pub fn paint_on_mesh(
+        &mut self,
+        obj_id: suite_doc::ObjId,
+        from_uv: [f32; 2],
+        to_uv: [f32; 2],
+        brush: &Brush,
+        pressure: f32,
+    ) {
+        let pressure = pressure.clamp(0.01, 1.0);
+        let effective = Brush {
+            radius_uv: brush.radius_uv * pressure.sqrt(),
+            flow: brush.flow * pressure,
+            ..*brush
+        };
+        // Create the per-mesh canvas lazily. Transparent start means unpainted
+        // faces show the flat-shaded surface color normally.
+        if !self.mesh_textures.contains_key(&obj_id) {
+            let canvas = RasterCanvas::new(&self.device, 1024, [0.0, 0.0, 0.0, 0.0]);
+            // Build the bind group while we still own `canvas` and can reference its view.
+            let bg = {
+                let view = canvas.texture_view();
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("mesh paint bg"),
+                    layout: &self.texture_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.paint_sampler),
+                        },
+                    ],
+                })
+            };
+            self.mesh_textures.insert(obj_id, (canvas, bg));
+        }
+        let (canvas, _) = self.mesh_textures.get_mut(&obj_id).unwrap();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mesh paint stamp enc"),
+        });
+        canvas.stamp_segment(&self.device, &mut enc, from_uv, to_uv, &effective, None);
+        self.queue.submit(Some(enc.finish()));
+    }
+
+    /// Finish the current paint stroke — commits its undo entry. Call on mouse-up.
+    pub fn paint_end_stroke(&mut self) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint end stroke enc"),
+            });
+        self.layers[self.active_layer].canvas.end_stroke(&self.device, &mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+    }
+
+    /// Undo the last paint stroke / clear on the active layer. Returns whether changed.
+    pub fn paint_undo(&mut self) -> bool {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint undo enc"),
+            });
+        let changed = self.layers[self.active_layer].canvas.undo(&self.device, &mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+        changed
+    }
+    /// Redo the last undone paint change on the active layer.
+    pub fn paint_redo(&mut self) -> bool {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint redo enc"),
+            });
+        let changed = self.layers[self.active_layer].canvas.redo(&self.device, &mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+        changed
+    }
+    pub fn paint_can_undo(&self) -> bool {
+        self.layers[self.active_layer].canvas.can_undo()
+    }
+    pub fn paint_can_redo(&self) -> bool {
+        self.layers[self.active_layer].canvas.can_redo()
+    }
+
+    /// Wipe the active layer back to paper (undoable).
+    pub fn paint_clear(&mut self) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint clear enc"),
+            });
+        self.layers[self.active_layer].canvas.clear_undoable(&self.device, &mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+    }
+
+    /// Replace the active layer with `pixels` (`paint_size()`²·4 RGBA8) as a single
+    /// undoable edit (used by image import). `⌘Z` reverts to the prior layer.
+    pub fn paint_upload_rgba_undoable(&mut self, pixels: &[u8]) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint import enc"),
+            });
+        self.layers[self.active_layer]
+            .canvas
+            .upload_rgba_undoable(&self.device, &self.queue, &mut enc, pixels);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+    }
+
+    /// The paint texture's side length in texels (square).
+    pub fn paint_size(&self) -> u32 {
+        self.raster.size()
+    }
+
+    /// GPU→CPU readback of the whole paint texture as row-major RGBA8 (top-left origin).
+    /// Blocking — used on save, not in the paint loop.
+    pub fn paint_readback_rgba(&self) -> Vec<u8> {
+        let size = self.raster.size();
+        let bpr = size * 4;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("paint readback"),
+            size: (bpr * size) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("paint readback enc"),
+            });
+        // Flatten the layer stack into the display cache first, so the readback (used by
+        // save + Export PNG) captures the *visible composite*, not a stale cache.
+        self.record_composite(&mut enc);
+        enc.copy_texture_to_buffer(
+            self.raster.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| {
+            let _ = r;
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        data.to_vec()
+    }
+
+    /// Eyedropper: read the paint-canvas colour at `uv` (0..1, top-left origin) as a
+    /// **linear** RGBA suitable for `Brush::color`. The stored texture is sRGB-encoded, so
+    /// this sRGB-decodes the sampled texel. Blocking readback — used on a single click.
+    pub fn pick_paint_color(&self, uv: [f32; 2]) -> [f32; 4] {
+        let size = self.raster.size();
+        let pixels = self.paint_readback_rgba();
+        let x = (uv[0].clamp(0.0, 0.999) * size as f32) as u32;
+        let y = (uv[1].clamp(0.0, 0.999) * size as f32) as u32;
+        let i = ((y * size + x) * 4) as usize;
+        if i + 3 >= pixels.len() {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+        let srgb_to_linear = |c: f32| {
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        [
+            srgb_to_linear(pixels[i] as f32 / 255.0),
+            srgb_to_linear(pixels[i + 1] as f32 / 255.0),
+            srgb_to_linear(pixels[i + 2] as f32 / 255.0),
+            pixels[i + 3] as f32 / 255.0,
+        ]
+    }
+
+    /// Upload a full-canvas RGBA8 image into the canvas (used on project load). Opening a
+    /// `.sweet` loads a *flattened* painting, so this collapses to one background layer.
+    pub fn paint_upload_rgba(&mut self, pixels: &[u8]) {
+        self.active_layer = 0;
+        self.layers.truncate(1);
+        self.layers[0].name = "Background".to_string();
+        self.layers[0].visible = true;
+        self.layers[0].opacity = 1.0;
+        self.layers[0].canvas.upload_rgba(&self.queue, pixels);
+        self.layers_dirty = true;
+    }
+
+    // ---- Layer stack (2D editing) -------------------------------------------------
+
+    /// Composite all visible layers (bottom→top, alpha-over × opacity) into the display
+    /// cache `self.raster` that `PaintCanvas` objects sample. Recorded into `encoder`.
+    fn record_composite(&self, encoder: &mut wgpu::CommandEncoder) {
+        let size = self.raster.size();
+        let visible: Vec<usize> =
+            (0..self.layers.len()).filter(|&i| self.layers[i].visible).collect();
+
+        // Start with a transparent base in comp_a.
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("composite clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.comp_a_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        let mut base_is_a = true;
+        for (k, &i) in visible.iter().enumerate() {
+            // The bottom layer blends over nothing → force Normal (other modes over a
+            // transparent base would give wrong colours).
+            let mode = if k == 0 { 0u32 } else { blend_mode_u32(self.layers[i].blend) };
+            let op = self.layers[i].opacity.clamp(0.0, 1.0);
+            let bytes: [u8; 16] = bytemuck::cast([mode, op.to_bits(), 0u32, 0u32]);
+            let ubuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("layer blend params"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let (base_view, target_view) = if base_is_a {
+                (&self.comp_a_view, &self.comp_b_view)
+            } else {
+                (&self.comp_b_view, &self.comp_a_view)
+            };
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("layer composite bg"),
+                layout: &self.layer_composite_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(base_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(self.layers[i].canvas.texture_view()),
+                    },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: ubuf.as_entire_binding() },
+                ],
+            });
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("layer composite pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&self.layer_composite_pipeline);
+                rp.set_bind_group(0, &bg, &[]);
+                rp.draw(0..4, 0..1);
+            }
+            base_is_a = !base_is_a;
+        }
+
+        // The final result is in whichever buffer is the current base. Copy → display cache.
+        let final_tex = if base_is_a { &self.comp_a } else { &self.comp_b };
+        encoder.copy_texture_to_texture(
+            final_tex.as_image_copy(),
+            self.raster.texture().as_image_copy(),
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Recomposite the layer stack into the display cache (own encoder + submit).
+    fn composite_layers(&mut self) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("composite enc") });
+        self.record_composite(&mut enc);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = false;
+    }
+
+    /// Metadata snapshot for the Layers panel (index 0 = bottom).
+    pub fn layer_infos(&self) -> Vec<LayerInfo> {
+        self.layers
+            .iter()
+            .map(|l| LayerInfo { name: l.name.clone(), visible: l.visible, opacity: l.opacity, blend: l.blend })
+            .collect()
+    }
+    pub fn set_layer_blend(&mut self, i: usize, blend: suite_doc::BlendMode) {
+        if let Some(l) = self.layers.get_mut(i) {
+            l.blend = blend;
+            self.layers_dirty = true;
+        }
+    }
+    pub fn active_layer(&self) -> usize {
+        self.active_layer
+    }
+    pub fn set_active_layer(&mut self, i: usize) {
+        if i < self.layers.len() {
+            self.active_layer = i;
+        }
+    }
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+    /// Add a transparent layer above the active one and make it active.
+    pub fn add_layer(&mut self) {
+        let size = self.layers[0].canvas.size();
+        let mut canvas = RasterCanvas::new(&self.device, size, [0.0, 0.0, 0.0, 0.0]);
+        {
+            let mut enc = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("new layer clear") });
+            canvas.clear(&mut enc);
+            self.queue.submit(Some(enc.finish()));
+        }
+        let idx = self.active_layer + 1;
+        let name = format!("Layer {}", self.layers.len() + 1);
+        self.layers.insert(idx, PaintLayer { canvas, name, visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal });
+        self.active_layer = idx;
+        self.layers_dirty = true;
+    }
+    /// Remove layer `i` (keeps at least one layer).
+    pub fn delete_layer(&mut self, i: usize) {
+        if self.layers.len() <= 1 || i >= self.layers.len() {
+            return;
+        }
+        self.layers.remove(i);
+        if self.active_layer >= self.layers.len() {
+            self.active_layer = self.layers.len() - 1;
+        }
+        self.layers_dirty = true;
+    }
+    pub fn set_layer_visible(&mut self, i: usize, visible: bool) {
+        if let Some(l) = self.layers.get_mut(i) {
+            l.visible = visible;
+            self.layers_dirty = true;
+        }
+    }
+    pub fn set_layer_opacity(&mut self, i: usize, opacity: f32) {
+        if let Some(l) = self.layers.get_mut(i) {
+            l.opacity = opacity.clamp(0.0, 1.0);
+            self.layers_dirty = true;
+        }
+    }
+    /// Move layer `i` one step toward the top (`up`) or bottom; updates `active_layer`.
+    pub fn move_layer(&mut self, i: usize, up: bool) {
+        let n = self.layers.len();
+        if n < 2 || i >= n {
+            return;
+        }
+        let j = if up { i + 1 } else { i.wrapping_sub(1) };
+        if j >= n {
+            return;
+        }
+        self.layers.swap(i, j);
+        if self.active_layer == i {
+            self.active_layer = j;
+        } else if self.active_layer == j {
+            self.active_layer = i;
+        }
+        self.layers_dirty = true;
+    }
+
+    /// Read back layer `i`'s raw RGBA8 pixels (the layer itself, not the composite) — used
+    /// by save. Blocking. Empty if `i` is out of range.
+    pub fn layer_pixels(&self, i: usize) -> Vec<u8> {
+        let canvas = match self.layers.get(i) {
+            Some(l) => &l.canvas,
+            None => return Vec::new(),
+        };
+        let size = canvas.size();
+        let bpr = size * 4;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer readback"),
+            size: (bpr * size) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("layer readback enc") });
+        enc.copy_texture_to_buffer(
+            canvas.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        slice.get_mapped_range().to_vec()
+    }
+
+    /// Replace the whole layer stack (used on project load). Each `LoadedLayer.rgba` must be
+    /// `paint_size()²·4` bytes or it's left transparent. Resets the active layer to 0.
+    pub fn replace_layers(&mut self, loaded: Vec<LoadedLayer>) {
+        if loaded.is_empty() {
+            return;
+        }
+        let size = self.paint_size();
+        let expected = (size * size * 4) as usize;
+        let mut layers = Vec::with_capacity(loaded.len());
+        for l in loaded {
+            let mut canvas = RasterCanvas::new(&self.device, size, [0.0, 0.0, 0.0, 0.0]);
+            if l.rgba.len() == expected {
+                canvas.upload_rgba(&self.queue, &l.rgba);
+            } else {
+                let mut enc = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("load layer clear") });
+                canvas.clear(&mut enc);
+                self.queue.submit(Some(enc.finish()));
+            }
+            layers.push(PaintLayer { canvas, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend });
+        }
+        self.layers = layers;
+        self.active_layer = 0;
+        self.layers_dirty = true;
+    }
+
+    /// **Magic wand**: flood-fill from `seed_uv` on the paint canvas, selecting pixels
+    /// within `tolerance` (0–1 per channel) of the seed color. Fills the selection with
+    /// `fill_color` (RGBA linear, pre-multiplied alpha) and re-uploads the result.
+    ///
+    /// Returns the pixel count of the filled region (0 if seed lands outside a painted area).
+    ///
+    /// *Upgrade path:* replace the flood-fill heuristic with SAM (Segment Anything Model)
+    /// via the `ort` ONNX runtime once a model download can be authorized.
+    pub fn paint_magic_wand_fill(&mut self, seed_uv: [f32; 2], tolerance: f32, fill_color: [f32; 4]) -> usize {
+        let size = self.raster.size() as usize;
+        let mut pixels = self.paint_readback_rgba();
+
+        let px = (seed_uv[0].clamp(0.0, 0.9999) * size as f32) as usize;
+        let py = (seed_uv[1].clamp(0.0, 0.9999) * size as f32) as usize;
+        let seed_idx = (py * size + px) * 4;
+
+        // Copy seed color into scalars to avoid borrowing pixels in the BFS loop.
+        let (seed_r, seed_g, seed_b, seed_a) = (
+            pixels[seed_idx] as f32 / 255.0,
+            pixels[seed_idx + 1] as f32 / 255.0,
+            pixels[seed_idx + 2] as f32 / 255.0,
+            pixels[seed_idx + 3] as f32 / 255.0,
+        );
+
+        let fill_r = (fill_color[0].clamp(0.0, 1.0) * 255.0) as u8;
+        let fill_g = (fill_color[1].clamp(0.0, 1.0) * 255.0) as u8;
+        let fill_b = (fill_color[2].clamp(0.0, 1.0) * 255.0) as u8;
+        let fill_a = (fill_color[3].clamp(0.0, 1.0) * 255.0) as u8;
+
+        // BFS flood fill.
+        let mut visited = vec![false; size * size];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((px as isize, py as isize));
+        let mut count = 0usize;
+
+        while let Some((x, y)) = queue.pop_front() {
+            if x < 0 || y < 0 || x >= size as isize || y >= size as isize {
+                continue;
+            }
+            let xi = x as usize;
+            let yi = y as usize;
+            let flat = yi * size + xi;
+            if visited[flat] {
+                continue;
+            }
+            let idx = flat * 4;
+            // Check color similarity without a closure (avoids immutable borrow conflict).
+            let matches = (pixels[idx] as f32 / 255.0 - seed_r).abs() <= tolerance
+                && (pixels[idx + 1] as f32 / 255.0 - seed_g).abs() <= tolerance
+                && (pixels[idx + 2] as f32 / 255.0 - seed_b).abs() <= tolerance
+                && (pixels[idx + 3] as f32 / 255.0 - seed_a).abs() <= tolerance;
+            if !matches {
+                continue;
+            }
+            visited[flat] = true;
+            pixels[idx] = fill_r;
+            pixels[idx + 1] = fill_g;
+            pixels[idx + 2] = fill_b;
+            pixels[idx + 3] = fill_a;
+            count += 1;
+            queue.push_back((x - 1, y));
+            queue.push_back((x + 1, y));
+            queue.push_back((x, y - 1));
+            queue.push_back((x, y + 1));
+        }
+
+        if count > 0 {
+            self.layers[self.active_layer].canvas.upload_rgba(&self.queue, &pixels);
+            self.layers_dirty = true;
+        }
+        count
+    }
+
+    // ----- M4: core 2D ops (gradient fill, layer transforms) ---------------------------
+
+    /// GPU→CPU readback of just the **active layer's** canvas (not the flattened
+    /// composite) as row-major RGBA8 (top-left origin). Blocking. The stored texture is
+    /// `Rgba8UnormSrgb`, so the returned bytes are sRGB-encoded.
+    fn read_active_layer_rgba(&self) -> Vec<u8> {
+        let canvas = &self.layers[self.active_layer].canvas;
+        let size = canvas.size();
+        let bpr = size * 4;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("layer readback"),
+            size: (bpr * size) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("layer readback enc"),
+        });
+        enc.copy_texture_to_buffer(
+            canvas.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        data.to_vec()
+    }
+
+    /// Upload `pixels` into the active layer as one undoable edit (so ⌘Z reverts it).
+    fn write_active_layer_undoable(&mut self, pixels: &[u8]) {
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("layer write enc"),
+        });
+        self.layers[self.active_layer]
+            .canvas
+            .upload_rgba_undoable(&self.device, &self.queue, &mut enc, pixels);
+        self.queue.submit(Some(enc.finish()));
+        self.layers_dirty = true;
+    }
+
+    /// **Gradient fill** on the active layer. Interpolates between `color_a` (at `from_uv`)
+    /// and `color_b` (at `to_uv`), both **linear** RGBA. `radial=false` is a linear gradient
+    /// along the from→to vector; `radial=true` is a radial gradient centred at `from_uv` with
+    /// radius `|to_uv − from_uv|`. The gradient colour is alpha-composited over existing
+    /// pixels. Respects the active selection rect (only pixels inside are touched). Undoable.
+    pub fn paint_gradient_fill(
+        &mut self,
+        from_uv: [f32; 2],
+        to_uv: [f32; 2],
+        color_a: [f32; 4],
+        color_b: [f32; 4],
+        radial: bool,
+    ) {
+        let size = self.layers[self.active_layer].canvas.size() as usize;
+        let mut pixels = self.read_active_layer_rgba();
+        apply_gradient_fill(
+            &mut pixels,
+            size,
+            from_uv,
+            to_uv,
+            color_a,
+            color_b,
+            radial,
+            self.selection_rect,
+        );
+        self.write_active_layer_undoable(&pixels);
+    }
+
+    /// **Layer transform** on the active layer's pixels: flip/rotate the whole canvas as a
+    /// single undoable edit. Operates on a CPU readback then re-uploads. (Canvas is square,
+    /// so 90° rotations keep the same dimensions.)
+    pub fn transform_active_layer(&mut self, op: LayerTransform) {
+        let size = self.layers[self.active_layer].canvas.size() as usize;
+        let src = self.read_active_layer_rgba();
+        let dst = apply_layer_transform(&src, size, op);
+        self.write_active_layer_undoable(&dst);
+    }
+
+    /// Per-frame render. `gizmo` optionally draws a translate-gizmo overlay at the
+    /// supplied world-space origin. `egui_paint` optionally draws an egui frame on
+    /// top after the scene + overlays.
+    pub fn render(
+        &mut self,
+        doc: &Document,
+        gizmo: Option<GizmoOverlay>,
+        egui_paint: Option<
+            &mut dyn FnMut(
+                &mut wgpu::CommandEncoder,
+                &wgpu::TextureView,
+                &wgpu::Device,
+                &wgpu::Queue,
+                (u32, u32),
+            ),
+        >,
+    ) -> RenderResult {
+        // Flatten the 2D layer stack into the display cache before drawing, if it changed.
+        if self.layers_dirty {
+            self.composite_layers();
+        }
+        let aspect = self.aspect();
+        let view = self.camera.view();
+        let proj = self.camera.proj(aspect);
+        let view_proj = proj * view;
+        let inv_view_proj = view_proj.inverse();
+        let eye = self.camera.eye();
+        let camera_uniform = CameraUniform {
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: inv_view_proj.to_cols_array_2d(),
+            eye: [eye.x, eye.y, eye.z, 1.0],
+            proj_kind_and_pad: [
+                match self.camera.projection {
+                    Projection::Perspective => 0.0,
+                    Projection::Orthographic => 1.0,
+                },
+                0.0,
+                0.0,
+                0.0,
+            ],
+        };
+        self.queue.write_buffer(
+            &self.camera_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&camera_uniform),
+        );
+
+        // Slot 0 is reserved for "world-space identity" — used by the gizmo and any
+        // future overlay that wants to pass vertices already in world coords.
+        let identity_uniform = ObjectUniform {
+            model: Mat4::IDENTITY.to_cols_array_2d(),
+            color: [1.0, 1.0, 1.0, 1.0],
+            selected_pad: [0.0, 0.0, 0.0, 0.0],
+        };
+        self.queue.write_buffer(
+            &self.object_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&identity_uniform),
+        );
+
+        // Pack visible objects into slots 1..; bail if we'd overflow the buffer.
+        let selection = doc.selection();
+        let mut draws: Vec<(ObjId, ObjectKind, u32)> = Vec::new();
+        for (i, object) in doc.objects().enumerate() {
+            if !object.visibility {
+                continue;
+            }
+            let slot_idx = (i as u32).saturating_add(1);
+            if slot_idx >= self.object_slots {
+                break;
+            }
+            let uniform = ObjectUniform {
+                model: object.world_matrix().to_cols_array_2d(),
+                color: object.color,
+                selected_pad: [
+                    if Some(object.id) == selection {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+            };
+            let offset = slot_idx as u64 * OBJECT_SLOT_BYTES;
+            self.queue.write_buffer(
+                &self.object_uniform_buffer,
+                offset,
+                bytemuck::bytes_of(&uniform),
+            );
+            draws.push((object.id, object.kind, slot_idx));
+        }
+
+        // Tessellate every editable Mesh object into a transient vertex buffer up-front so
+        // the buffers outlive the render pass. Small meshes → cheap to rebuild each frame;
+        // a dirty-flag cache is the optimization once meshes get heavy.
+        // Meshes with a paint texture use MeshVertex (with UV) and the mesh_paint_pipeline.
+        let mut mesh_draws: Vec<(u32, wgpu::Buffer, u32)> = Vec::new();
+        let mut mesh_paint_draws: Vec<(suite_doc::ObjId, u32, wgpu::Buffer, u32)> = Vec::new();
+        for &(id, kind, slot_idx) in &draws {
+            if kind != ObjectKind::Mesh {
+                continue;
+            }
+            let Some(obj) = doc.get(id) else { continue };
+            // The display mesh = base with the modifier stack applied (clone when empty).
+            let Some(display) = obj.display_mesh() else {
+                continue;
+            };
+            // Face highlight only maps to display faces when there are no modifiers (a
+            // generated mesh's face indices don't correspond to the editable base).
+            let hi_face = if Some(id) == selection && obj.modifiers.is_empty() {
+                doc.selected_face()
+            } else {
+                None
+            };
+            if self.mesh_textures.contains_key(&id) {
+                let verts = tessellate_mesh_painted(&display, hi_face);
+                if verts.is_empty() { continue; }
+                let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh paint transient vbuf"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                mesh_paint_draws.push((id, slot_idx, buf, verts.len() as u32));
+            } else {
+                let verts = tessellate_mesh(&display, hi_face);
+                if verts.is_empty() { continue; }
+                let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("mesh transient vbuf"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                mesh_draws.push((slot_idx, buf, verts.len() as u32));
+            }
+        }
+
+        let frame = match self.surface_state.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return RenderResult::Skipped,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                return RenderResult::SurfaceLostOrOutdated;
+            }
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_start = Instant::now();
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame encoder"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(linear_to_clear(CHROME_BG0_LINEAR)),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.surface_state.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+
+            // Opaque primitives: cubes, spheres (fixed meshes).
+            for &(_, kind, slot_idx) in &draws {
+                let mesh = match kind {
+                    ObjectKind::Cube => &self.cube_mesh,
+                    ObjectKind::Sphere => &self.sphere_mesh,
+                    ObjectKind::ImagePlane
+                    | ObjectKind::PaintCanvas
+                    | ObjectKind::Mesh
+                    | ObjectKind::Adjustment => continue,
+                };
+                let offset = slot_idx * OBJECT_SLOT_BYTES as u32;
+                rpass.set_pipeline(&self.scene_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                rpass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                rpass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+
+            // Editable meshes (tessellated this frame), non-indexed.
+            for (slot_idx, buf, vcount) in &mesh_draws {
+                let offset = slot_idx * OBJECT_SLOT_BYTES as u32;
+                rpass.set_pipeline(&self.scene_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                rpass.set_vertex_buffer(0, buf.slice(..));
+                rpass.draw(0..*vcount, 0..1);
+            }
+
+            // Editable meshes with per-mesh paint textures (MeshVertex + mesh_paint_pipeline).
+            for (id, slot_idx, buf, vcount) in &mesh_paint_draws {
+                let Some((_, paint_bg)) = self.mesh_textures.get(id) else { continue };
+                let offset = slot_idx * OBJECT_SLOT_BYTES as u32;
+                rpass.set_pipeline(&self.mesh_paint_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                rpass.set_bind_group(2, paint_bg, &[]);
+                rpass.set_vertex_buffer(0, buf.slice(..));
+                rpass.draw(0..*vcount, 0..1);
+            }
+
+            // Textured planes: image planes sample the checker, paint canvases sample the
+            // live raster substrate. Both use the same quad pipeline + plane mesh.
+            for &(_, kind, slot_idx) in &draws {
+                let bind = match kind {
+                    ObjectKind::ImagePlane => &self.quad_bind_group,
+                    ObjectKind::PaintCanvas => &self.paint_bind_group,
+                    _ => continue,
+                };
+                let offset = slot_idx * OBJECT_SLOT_BYTES as u32;
+                rpass.set_pipeline(&self.quad_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                rpass.set_bind_group(2, bind, &[]);
+                rpass.set_vertex_buffer(0, self.plane_mesh.vertex_buffer.slice(..));
+                rpass.set_index_buffer(
+                    self.plane_mesh.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint16,
+                );
+                rpass.draw_indexed(0..self.plane_mesh.index_count, 0, 0..1);
+            }
+
+            // Selection outline (wireframe AABB), drawn on top with depth read-only.
+            if let Some(sel_id) = selection {
+                if let Some(slot_idx) = draws.iter().position(|d| d.0 == sel_id) {
+                    let offset = slot_idx as u32 * OBJECT_SLOT_BYTES as u32;
+                    let aabb = doc
+                        .get(sel_id)
+                        .map(|o| o.local_aabb)
+                        .unwrap_or_else(suite_doc::Aabb::unit);
+                    let lines = aabb_line_vertices(aabb, ACCENT_BASE_LINEAR);
+                    // One-shot vertex buffer for the selection lines. The buffer is
+                    // dropped at end of frame; with ~24 verts it's cheap.
+                    let outline_buf =
+                        self.device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("outline lines vbuf"),
+                                contents: bytemuck::cast_slice(&lines),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            });
+                    rpass.set_pipeline(&self.outline_pipeline);
+                    rpass.set_bind_group(1, &self.object_bind_group, &[offset]);
+                    rpass.set_vertex_buffer(0, outline_buf.slice(..));
+                    rpass.draw(0..lines.len() as u32, 0..1);
+                    // Keep the buffer alive long enough by leaking into a stack-frame
+                    // slot. (wgpu refcounts the backing buffer; the wrapper dropping
+                    // here after the draw is fine because the encoder retains the bind.)
+                    drop(outline_buf);
+                }
+            }
+
+            // Translate gizmo on top of the scene, depth-tested so it can hide behind
+            // distant geometry but always wins ties against the same surface.
+            if let Some(g) = gizmo {
+                let lines = gizmo_axis_lines(g);
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("translate gizmo vbuf"),
+                        contents: bytemuck::cast_slice(&lines),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                rpass.set_pipeline(&self.outline_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[0]); // identity slot
+                rpass.set_vertex_buffer(0, buf.slice(..));
+                rpass.draw(0..lines.len() as u32, 0..1);
+                drop(buf);
+            }
+
+            // Snap indicator — a small bright sphere at the magnetic snap point.
+            if let Some(snap_pos) = self.snap_indicator {
+                let scale = 0.08_f32;
+                let model = glam::Mat4::from_scale_rotation_translation(
+                    glam::Vec3::splat(scale),
+                    glam::Quat::IDENTITY,
+                    glam::Vec3::from(snap_pos),
+                );
+                let snap_uniform = ObjectUniform {
+                    model: model.to_cols_array_2d(),
+                    color: [1.0, 0.85, 0.0, 1.0], // bright yellow
+                    selected_pad: [0.0; 4],
+                };
+                // Write into the identity slot (slot 0 is safe — grid and gizmo already drew).
+                self.queue.write_buffer(
+                    &self.object_uniform_buffer,
+                    0,
+                    bytemuck::bytes_of(&snap_uniform),
+                );
+                rpass.set_pipeline(&self.scene_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[0]);
+                rpass.set_vertex_buffer(0, self.sphere_mesh.vertex_buffer.slice(..));
+                rpass.set_index_buffer(self.sphere_mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                rpass.draw_indexed(0..self.sphere_mesh.index_count, 0, 0..1);
+            }
+
+            // Skeleton overlay — bone segments + a small joint cross at each head. Drawn
+            // with the line pipeline in the identity slot, depth-tested so bones inside the
+            // mesh are occluded by it (reads as "the rig lives in the surface").
+            if !self.skeleton_segments.is_empty() {
+                let lines = skeleton_lines(&self.skeleton_segments);
+                let buf = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("skeleton vbuf"),
+                        contents: bytemuck::cast_slice(&lines),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                rpass.set_pipeline(&self.outline_pipeline);
+                rpass.set_bind_group(1, &self.object_bind_group, &[0]); // identity slot
+                rpass.set_vertex_buffer(0, buf.slice(..));
+                rpass.draw(0..lines.len() as u32, 0..1);
+                drop(buf);
+            }
+
+            // Procedural infinite grid — full-screen triangle, drawn last so transparency works.
+            rpass.set_pipeline(&self.grid_pipeline);
+            rpass.set_bind_group(1, &self.object_bind_group, &[0]); // unused but satisfies layout
+            rpass.draw(0..3, 0..1);
+        }
+
+        if let Some(egui_paint) = egui_paint {
+            (egui_paint)(&mut encoder, &view, &self.device, &self.queue, self.size());
+        }
+
+        let cpu_submit_done = Instant::now();
+        self.queue.submit(Some(encoder.finish()));
+        let cpu_submit_ms = cpu_submit_done.duration_since(frame_start).as_secs_f32() * 1000.0;
+        self.window.pre_present_notify();
+        frame.present();
+
+        self.budget.record(cpu_submit_ms);
+        RenderResult::Presented
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderResult {
+    Presented,
+    Skipped,
+    SurfaceLostOrOutdated,
+}
+
+// ---------- Mesh helpers ----------
+
+fn build_mesh(device: &wgpu::Device, mesh: &(Vec<Vertex>, Vec<u16>)) -> MeshAsset {
+    let (vertices, indices) = mesh;
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh vbuf"),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh ibuf"),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    MeshAsset {
+        vertex_buffer,
+        index_buffer,
+        index_count: indices.len() as u32,
+    }
+}
+
+/// Fan-triangulate an editable `suite_doc::Mesh` into flat-shaded vertices. Each face's
+/// flat normal drives a simple lambert against a fixed sun so the geometry reads as 3D
+/// without a real lighting pass (matching the sphere's shading).
+fn tessellate_mesh(mesh: &suite_doc::Mesh, highlight_face: Option<usize>) -> Vec<Vertex> {
+    let sun = glam::Vec3::new(0.4, 0.8, 0.45).normalize();
+    let mut out = Vec::new();
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        if face.indices.len() < 3 {
+            continue;
+        }
+        let n = mesh.face_normal(face);
+        let nv = glam::Vec3::new(n[0], n[1], n[2]);
+        let ndotl = nv.dot(sun).max(0.0);
+        let shade = 0.28 + 0.72 * ndotl;
+        let color = if Some(fi) == highlight_face {
+            // Accent-tinted so the focused face reads clearly.
+            [
+                0.18 + 0.30 * shade,
+                0.34 + 0.30 * shade,
+                0.86 * shade.max(0.5),
+                1.0,
+            ]
+        } else {
+            [0.62 * shade, 0.66 * shade, 0.72 * shade, 1.0]
+        };
+        // Fan: (v0, vk, vk+1).
+        let v0 = mesh.vertex(face.indices[0]);
+        for k in 1..face.indices.len() - 1 {
+            let a = mesh.vertex(face.indices[k]);
+            let b = mesh.vertex(face.indices[k + 1]);
+            out.push(Vertex {
+                position: v0,
+                _pad0: 0.0,
+                color,
+            });
+            out.push(Vertex {
+                position: a,
+                _pad0: 0.0,
+                color,
+            });
+            out.push(Vertex {
+                position: b,
+                _pad0: 0.0,
+                color,
+            });
+        }
+    }
+    out
+}
+
+/// Tessellate a mesh with UV coordinates for mesh-paint rendering. Uses box (triplanar)
+/// UV projection: the dominant axis of the face normal picks which two world-space axes
+/// drive UV so the paint texture wraps predictably without a UV unwrap.
+fn tessellate_mesh_painted(
+    mesh: &suite_doc::Mesh,
+    highlight_face: Option<usize>,
+) -> Vec<MeshVertex> {
+    let sun = glam::Vec3::new(0.4, 0.8, 0.45).normalize();
+    let mut out = Vec::new();
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        if face.indices.len() < 3 {
+            continue;
+        }
+        let n = mesh.face_normal(face);
+        let nv = glam::Vec3::new(n[0], n[1], n[2]);
+        let ndotl = nv.dot(sun).max(0.0);
+        let shade = 0.28 + 0.72 * ndotl;
+        let color = if Some(fi) == highlight_face {
+            [
+                0.18 + 0.30 * shade,
+                0.34 + 0.30 * shade,
+                0.86 * shade.max(0.5),
+                1.0,
+            ]
+        } else {
+            [0.62 * shade, 0.66 * shade, 0.72 * shade, 1.0]
+        };
+        // Box UV: dominant face-normal axis selects the UV plane.
+        // ax, ay are the two vertex component indices for U and V.
+        let abs_n = nv.abs();
+        let (ax, ay) = if abs_n.x >= abs_n.y && abs_n.x >= abs_n.z {
+            (2usize, 1usize) // YZ plane
+        } else if abs_n.y >= abs_n.x && abs_n.y >= abs_n.z {
+            (0, 2) // XZ plane
+        } else {
+            (0, 1) // XY plane
+        };
+        let uv_of = |pos: [f32; 3]| -> [f32; 2] {
+            [pos[ax] * 0.5 + 0.5, pos[ay] * 0.5 + 0.5]
+        };
+
+        let v0 = mesh.vertex(face.indices[0]);
+        for k in 1..face.indices.len() - 1 {
+            let a = mesh.vertex(face.indices[k]);
+            let b = mesh.vertex(face.indices[k + 1]);
+            out.push(MeshVertex { position: v0, _pad0: 0.0, color, uv: uv_of(v0), _pad1: [0.0; 2] });
+            out.push(MeshVertex { position: a,  _pad0: 0.0, color, uv: uv_of(a),  _pad1: [0.0; 2] });
+            out.push(MeshVertex { position: b,  _pad0: 0.0, color, uv: uv_of(b),  _pad1: [0.0; 2] });
+        }
+    }
+    out
+}
+
+fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
+    let face_colors: [[f32; 4]; 6] = [
+        [0.95, 0.34, 0.30, 1.0],
+        [0.25, 0.71, 0.49, 1.0],
+        [0.89, 0.70, 0.25, 1.0],
+        [0.55, 0.51, 0.94, 1.0],
+        [0.30, 0.56, 0.86, 1.0],
+        [0.86, 0.45, 0.66, 1.0],
+    ];
+    let raw: [[[f32; 3]; 4]; 6] = [
+        [
+            [0.5, -0.5, 0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, 0.5, -0.5],
+            [0.5, 0.5, 0.5],
+        ],
+        [
+            [-0.5, -0.5, -0.5],
+            [-0.5, -0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+            [-0.5, 0.5, -0.5],
+        ],
+        [
+            [-0.5, 0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [0.5, 0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+        ],
+        [
+            [-0.5, -0.5, -0.5],
+            [0.5, -0.5, -0.5],
+            [0.5, -0.5, 0.5],
+            [-0.5, -0.5, 0.5],
+        ],
+        [
+            [-0.5, -0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0.5, 0.5, 0.5],
+            [-0.5, 0.5, 0.5],
+        ],
+        [
+            [0.5, -0.5, -0.5],
+            [-0.5, -0.5, -0.5],
+            [-0.5, 0.5, -0.5],
+            [0.5, 0.5, -0.5],
+        ],
+    ];
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    for (face_idx, corners) in raw.iter().enumerate() {
+        let base = (face_idx * 4) as u16;
+        let color = face_colors[face_idx];
+        for c in corners {
+            vertices.push(Vertex {
+                position: *c,
+                _pad0: 0.0,
+                color,
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    (vertices, indices)
+}
+
+fn uv_sphere_vertices(longitudes: u32, latitudes: u32) -> (Vec<Vertex>, Vec<u16>) {
+    let radius = 0.5;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for lat in 0..=latitudes {
+        let theta = lat as f32 / latitudes as f32 * std::f32::consts::PI;
+        let st = theta.sin();
+        let ct = theta.cos();
+        for lon in 0..=longitudes {
+            let phi = lon as f32 / longitudes as f32 * std::f32::consts::TAU;
+            let sp = phi.sin();
+            let cp = phi.cos();
+            let x = radius * st * cp;
+            let y = radius * ct;
+            let z = radius * st * sp;
+            // Shade from a fixed sun direction so the sphere doesn't look flat without lighting.
+            let n = glam::Vec3::new(x, y, z).normalize_or_zero();
+            let l = glam::Vec3::new(0.55, 0.7, 0.45).normalize();
+            let ndotl = n.dot(l).max(0.0);
+            let t = 0.25 + 0.75 * ndotl;
+            vertices.push(Vertex {
+                position: [x, y, z],
+                _pad0: 0.0,
+                color: [t, t, t, 1.0],
+            });
+        }
+    }
+    let stride = longitudes + 1;
+    for lat in 0..latitudes {
+        for lon in 0..longitudes {
+            let a = lat * stride + lon;
+            let b = a + stride;
+            let c = b + 1;
+            let d = a + 1;
+            indices
+                .extend_from_slice(&[a as u16, b as u16, c as u16, a as u16, c as u16, d as u16]);
+        }
+    }
+    (vertices, indices)
+}
+
+fn plane_vertices() -> (Vec<Vertex>, Vec<u16>) {
+    let v = |x: f32, y: f32, color: [f32; 4]| Vertex {
+        position: [x, y, 0.0],
+        _pad0: 0.0,
+        color,
+    };
+    let vertices = vec![
+        v(-0.5, -0.5, [0.89, 0.70, 0.25, 1.0]),
+        v(0.5, -0.5, [0.89, 0.70, 0.25, 1.0]),
+        v(0.5, 0.5, [0.89, 0.70, 0.25, 1.0]),
+        v(-0.5, 0.5, [0.89, 0.70, 0.25, 1.0]),
+    ];
+    let indices = vec![0, 1, 2, 0, 2, 3];
+    (vertices, indices)
+}
+
+fn gizmo_axis_lines(g: GizmoOverlay) -> Vec<Vertex> {
+    // Each axis: a shaft from the origin to origin + axis * scale, plus a small
+    // 4-line "X" arrowhead at the tip so a LineList is enough (no triangles).
+    let highlight_tint = |base: [f32; 4], lit: bool| -> [f32; 4] {
+        if lit {
+            [
+                (base[0] * 0.4 + 0.6).min(1.0),
+                (base[1] * 0.4 + 0.6).min(1.0),
+                (base[2] * 0.4 + 0.6).min(1.0),
+                base[3],
+            ]
+        } else {
+            base
+        }
+    };
+    let mut out: Vec<Vertex> = Vec::with_capacity(3 * 12);
+    let scale = g.world_scale.max(0.05);
+    for axis in [GizmoAxis::X, GizmoAxis::Y, GizmoAxis::Z] {
+        let base_color = match axis {
+            GizmoAxis::X => [0.95, 0.34, 0.30, 1.0],
+            GizmoAxis::Y => [0.25, 0.71, 0.49, 1.0],
+            GizmoAxis::Z => [0.30, 0.56, 0.86, 1.0],
+        };
+        let color = highlight_tint(base_color, g.highlighted == Some(axis));
+        let dir = axis.unit();
+        let origin = g.origin;
+        let tip = origin + dir * scale;
+        // Shaft.
+        out.push(Vertex {
+            position: origin.into(),
+            _pad0: 0.0,
+            color,
+        });
+        out.push(Vertex {
+            position: tip.into(),
+            _pad0: 0.0,
+            color,
+        });
+        // Tiny "X" cross at the tip — two diagonal lines in the plane perpendicular to the axis.
+        let head_len = scale * 0.16;
+        let perp = orthogonal_basis(dir);
+        let head_tip = tip + dir * head_len * 0.6;
+        for sign in [1.0_f32, -1.0_f32] {
+            let p = tip + (perp.0 + perp.1) * sign * head_len * 0.5;
+            let q = tip - (perp.0 + perp.1) * sign * head_len * 0.5;
+            out.push(Vertex {
+                position: p.into(),
+                _pad0: 0.0,
+                color,
+            });
+            out.push(Vertex {
+                position: head_tip.into(),
+                _pad0: 0.0,
+                color,
+            });
+            out.push(Vertex {
+                position: q.into(),
+                _pad0: 0.0,
+                color,
+            });
+            out.push(Vertex {
+                position: head_tip.into(),
+                _pad0: 0.0,
+                color,
+            });
+        }
+    }
+    out
+}
+
+/// Build a LineList for a skeleton: each bone is a shaft (head→tail) plus a small
+/// 3-axis cross at the head so joints are visible. Bone color is a warm bone-white;
+/// the cross is a brighter accent so the joint reads against the shaft.
+fn skeleton_lines(segments: &[([f32; 3], [f32; 3])]) -> Vec<Vertex> {
+    const BONE: [f32; 4] = [0.95, 0.80, 0.45, 1.0]; // warm bone color
+    const JOINT: [f32; 4] = [1.0, 0.55, 0.20, 1.0]; // accent at joints
+    let mut out: Vec<Vertex> = Vec::with_capacity(segments.len() * 8);
+    for &(h, t) in segments {
+        let head = Vec3::from(h);
+        let tail = Vec3::from(t);
+        // Shaft.
+        out.push(Vertex { position: head.into(), _pad0: 0.0, color: BONE });
+        out.push(Vertex { position: tail.into(), _pad0: 0.0, color: BONE });
+        // Joint cross at the head — sized relative to the bone length so it scales sanely.
+        let r = (tail - head).length().max(0.05) * 0.12;
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            out.push(Vertex { position: (head - axis * r).into(), _pad0: 0.0, color: JOINT });
+            out.push(Vertex { position: (head + axis * r).into(), _pad0: 0.0, color: JOINT });
+        }
+    }
+    out
+}
+
+/// Two unit vectors orthogonal to `axis`, used for the gizmo's arrowhead crosshair.
+fn orthogonal_basis(axis: Vec3) -> (Vec3, Vec3) {
+    let helper = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let a = axis.cross(helper).normalize_or_zero();
+    let b = axis.cross(a).normalize_or_zero();
+    (a, b)
+}
+
+fn aabb_line_vertices(aabb: suite_doc::Aabb, color: [f32; 4]) -> Vec<Vertex> {
+    let corners = [
+        [aabb.min.x, aabb.min.y, aabb.min.z],
+        [aabb.max.x, aabb.min.y, aabb.min.z],
+        [aabb.max.x, aabb.max.y, aabb.min.z],
+        [aabb.min.x, aabb.max.y, aabb.min.z],
+        [aabb.min.x, aabb.min.y, aabb.max.z],
+        [aabb.max.x, aabb.min.y, aabb.max.z],
+        [aabb.max.x, aabb.max.y, aabb.max.z],
+        [aabb.min.x, aabb.max.y, aabb.max.z],
+    ];
+    let segs = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let mut out = Vec::with_capacity(segs.len() * 2);
+    for (a, b) in segs {
+        out.push(Vertex {
+            position: corners[a],
+            _pad0: 0.0,
+            color,
+        });
+        out.push(Vertex {
+            position: corners[b],
+            _pad0: 0.0,
+            color,
+        });
+    }
+    out
+}
+
+fn build_checker_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    let size: u32 = 64;
+    let mut data = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let on = ((x / 8) + (y / 8)) % 2 == 0;
+            let (r, g, b) = if on {
+                (0x28, 0x2C, 0x31)
+            } else {
+                (0x16, 0x18, 0x1B)
+            };
+            data.extend_from_slice(&[r, g, b, 0xFF]);
+        }
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("checker texture"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * size),
+            rows_per_image: Some(size),
+        },
+        wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("checker sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
+    (texture, view, sampler)
+}
+
+fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+fn linear_to_clear(linear: [f32; 4]) -> wgpu::Color {
+    wgpu::Color {
+        r: linear[0] as f64,
+        g: linear[1] as f64,
+        b: linear[2] as f64,
+        a: linear[3] as f64,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_render_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vs_entry: &str,
+    fs_entry: &str,
+    vertex_buffers: &[wgpu::VertexBufferLayout],
+    color_format: wgpu::TextureFormat,
+    depth_format: Option<wgpu::TextureFormat>,
+    cull: Option<wgpu::Face>,
+    topology: wgpu::PrimitiveTopology,
+    depth_write: bool,
+    depth_compare: wgpu::CompareFunction,
+) -> wgpu::RenderPipeline {
+    let depth_stencil = depth_format.map(|f| wgpu::DepthStencilState {
+        format: f,
+        depth_write_enabled: Some(depth_write),
+        depth_compare: Some(depth_compare),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("scene pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(vs_entry),
+            compilation_options: Default::default(),
+            buffers: vertex_buffers,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            cull_mode: cull,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn make_render_pipeline_no_vbo(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    color_format: wgpu::TextureFormat,
+    depth_format: Option<wgpu::TextureFormat>,
+) -> wgpu::RenderPipeline {
+    let depth_stencil = depth_format.map(|f| wgpu::DepthStencilState {
+        format: f,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("grid pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+#[cfg(test)]
+mod m4_tests {
+    use super::{apply_gradient_fill, apply_layer_transform, LayerTransform};
+
+    /// A 4×4 buffer where each texel encodes its (x,y) into R,G so transforms are verifiable.
+    fn ramp(size: usize) -> Vec<u8> {
+        let mut v = vec![0u8; size * size * 4];
+        for y in 0..size {
+            for x in 0..size {
+                let i = (y * size + x) * 4;
+                v[i] = (x * 10) as u8;
+                v[i + 1] = (y * 10) as u8;
+                v[i + 2] = 0;
+                v[i + 3] = 255;
+            }
+        }
+        v
+    }
+
+    fn px(buf: &[u8], size: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * size + x) * 4;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn flip_h_mirrors_columns() {
+        let size = 4;
+        let src = ramp(size);
+        let out = apply_layer_transform(&src, size, LayerTransform::FlipH);
+        // Column 0 of the source (R=0) lands in column 3.
+        assert_eq!(px(&out, size, 3, 1), px(&src, size, 0, 1));
+        assert_eq!(px(&out, size, 0, 1), px(&src, size, 3, 1));
+    }
+
+    #[test]
+    fn flip_v_mirrors_rows() {
+        let size = 4;
+        let src = ramp(size);
+        let out = apply_layer_transform(&src, size, LayerTransform::FlipV);
+        assert_eq!(px(&out, size, 2, 3), px(&src, size, 2, 0));
+    }
+
+    #[test]
+    fn rotate_90_cw_then_ccw_is_identity() {
+        let size = 4;
+        let src = ramp(size);
+        let cw = apply_layer_transform(&src, size, LayerTransform::Rotate90Cw);
+        let back = apply_layer_transform(&cw, size, LayerTransform::Rotate90Ccw);
+        assert_eq!(src, back, "CW then CCW must restore the original");
+    }
+
+    #[test]
+    fn rotate_180_twice_is_identity() {
+        let size = 4;
+        let src = ramp(size);
+        let once = apply_layer_transform(&src, size, LayerTransform::Rotate180);
+        let twice = apply_layer_transform(&once, size, LayerTransform::Rotate180);
+        assert_eq!(src, twice);
+    }
+
+    #[test]
+    fn rotate_90_cw_maps_top_left_to_top_right() {
+        let size = 4;
+        let src = ramp(size); // top-left (0,0) has R=0,G=0
+        let out = apply_layer_transform(&src, size, LayerTransform::Rotate90Cw);
+        // CW: (x,y) -> (size-1-y, x). (0,0) -> (3,0).
+        assert_eq!(px(&out, size, 3, 0), px(&src, size, 0, 0));
+    }
+
+    #[test]
+    fn linear_gradient_is_opaque_at_start_and_transparent_at_end() {
+        // Opaque white → transparent across a 16-wide canvas on a black opaque background.
+        let size = 16;
+        let mut buf = vec![0u8; size * size * 4];
+        for p in buf.chunks_mut(4) {
+            p[3] = 255; // black, opaque
+        }
+        apply_gradient_fill(
+            &mut buf,
+            size,
+            [0.0, 0.5],
+            [1.0, 0.5],
+            [1.0, 1.0, 1.0, 1.0], // white, opaque at start
+            [1.0, 1.0, 1.0, 0.0], // white, transparent at end
+            false,
+            None,
+        );
+        // Far-left column: gradient alpha ~1 → fully white.
+        let left = px(&buf, size, 0, 8);
+        assert!(left[0] > 230, "left edge should be near-white, got {left:?}");
+        // Mid column: ~50% blend → a clear mid-grey, darker than the left.
+        let mid = px(&buf, size, size / 2, 8);
+        assert!(mid[0] < left[0] && mid[0] > 60, "middle should be mid-grey, got {mid:?}");
+        // Far-right column: alpha ~0, so mostly the black background shows through. (Not
+        // pure black: the last texel centre sits at t≈0.97, leaving a few % of white that
+        // sRGB encoding lifts — so assert "much darker than the middle", not "near zero".)
+        let right = px(&buf, size, size - 1, 8);
+        assert!(right[0] < mid[0] / 2, "right edge should fall off hard, got {right:?} vs mid {mid:?}");
+    }
+
+    #[test]
+    fn gradient_respects_selection_bounds() {
+        // Fill solid red but restrict to the left half via a selection; right half untouched.
+        let size = 16;
+        let mut buf = vec![0u8; size * size * 4];
+        for p in buf.chunks_mut(4) {
+            p[3] = 255; // opaque black
+        }
+        apply_gradient_fill(
+            &mut buf,
+            size,
+            [0.0, 0.5],
+            [0.0, 0.5], // zero-length → t=0 everywhere → color_a
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            false,
+            Some([0.0, 0.0, 0.5, 1.0]), // left half only
+        );
+        let inside = px(&buf, size, 2, 8);
+        assert!(inside[0] > 200 && inside[1] < 40, "inside selection is red, got {inside:?}");
+        let outside = px(&buf, size, 12, 8);
+        assert_eq!(outside, [0, 0, 0, 255], "outside selection stays untouched");
+    }
+}

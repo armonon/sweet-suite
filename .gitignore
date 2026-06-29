@@ -1,0 +1,12 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Packaged app bundles / distributables (built artifacts, not source)
+/dist/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

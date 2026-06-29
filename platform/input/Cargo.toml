@@ -1,0 +1,7 @@
+[package]
+name = "suite-input"
+version.workspace = true
+edition.workspace = true
+description = "Pen/mouse input, the morphing gizmo, snapping/magnet, selection, shortcuts."
+
+[dependencies]

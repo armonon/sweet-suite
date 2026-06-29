@@ -1,0 +1,34 @@
+[package]
+name = "suite-visual"
+version.workspace = true
+edition.workspace = true
+description = "The Visual app: 3D + design + paint on one canvas. Build FIRST; extract the platform from it."
+
+# All platform crates are wired ahead of use to show the intended structure.
+# Phase 0 actually exercises gpu + doc; the rest light up at later phases.
+[dependencies]
+suite-gpu = { path = "../../platform/gpu" }
+suite-ui = { path = "../../platform/ui" }
+suite-design = { path = "../../platform/design" }
+suite-input = { path = "../../platform/input" }
+suite-doc = { path = "../../platform/doc" }
+suite-timeline = { path = "../../platform/timeline" }
+suite-nodes = { path = "../../platform/nodes" }
+suite-assets = { path = "../../platform/assets" }
+suite-services = { path = "../../platform/services" }
+
+# Phase 0–3 lite: the app shell owns the winit event loop, holds the Document, and
+# drives the egui shell on top of the platform/gpu renderer.
+winit = { workspace = true }
+pollster = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
+serde_json = { workspace = true }
+rfd = { workspace = true }
+png = "0.18"
+# Broad image decode/encode for import/export (PNG/JPEG/BMP/TGA/GIF/WebP). MIT/Apache.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga", "gif", "webp"] }
+base64 = "0.22"
+egui = "0.35"
+egui-wgpu = "0.35"
+egui-winit = "0.35"

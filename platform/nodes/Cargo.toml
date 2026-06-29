@@ -1,0 +1,7 @@
+[package]
+name = "suite-nodes"
+version.workspace = true
+edition.workspace = true
+description = "Generic node editor + pull-based evaluation graph — one spine, three faces."
+
+[dependencies]

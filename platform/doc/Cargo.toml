@@ -1,0 +1,11 @@
+[package]
+name = "suite-doc"
+version.workspace = true
+edition.workspace = true
+description = "Object model, command/undo, serialization — the spine of the suite."
+
+[dependencies]
+glam = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+manifold3d = "0.3"

@@ -1,0 +1,46 @@
+# SWEET — the suite. Virtual Cargo workspace.
+# One shared platform (platform/*), three thin app binaries (apps/*).
+# Consistency & feasibility come from the platform, not packaging. See CLAUDE.md.
+
+[workspace]
+resolver = "2"
+members = [
+    # platform/* — built once, linked by every app. Grown by EXTRACTION from apps/visual.
+    "platform/gpu",       # wgpu abstraction, renderer, compositor
+    "platform/ui",        # shell, panels, docking, command palette
+    "platform/design",    # tokens + component kit (the look)
+    "platform/input",     # pen/mouse, the morphing gizmo, snapping, shortcuts
+    "platform/doc",       # object model, command/undo, serialization — THE SPINE
+    "platform/timeline",  # keyframe/track engine (3 faces)
+    "platform/nodes",     # node-graph framework (3 faces)
+    "platform/assets",    # universal project format, asset library, interchange
+    "platform/services",  # io, color mgmt, prefs, plugin host, licensing, update
+    # apps/* — thin shells: domain core + platform/*.
+    "apps/visual",        # 3D + design + paint on one canvas (build FIRST)
+    "apps/video",         # NLE (converges from COMPOSITOR)
+    "apps/audio",         # DAW (sibling binary, real-time isolated)
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "UNLICENSED"
+
+# Shared dependency versions land here as the platform grows (Phase 0+).
+[workspace.dependencies]
+wgpu = "29"          # Phase 0 — GPU abstraction (Vulkan/Metal/DX12/WebGPU)
+glam = { version = "0.33", features = ["serde"] }  # Phase 0 — math; serde for save/load
+winit = "0.30"       # Phase 0 — windowing
+bytemuck = { version = "1.25", features = ["derive"] }  # Phase 0 — vertex/uniform byte casting
+pollster = "0.4"     # Phase 0 — synchronous block on wgpu async init from main()
+serde = { version = "1", features = ["derive"] }   # persistence — the project fabric
+serde_json = "1"     # persistence — the .sweet bundle is JSON today
+rfd = "0.17"         # native open/save file dialogs in the shell
+
+[profile.dev]
+opt-level = 1        # keep debug builds responsive; the doctrine is "instant from frame 0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

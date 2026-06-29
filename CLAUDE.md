@@ -1,0 +1,124 @@
+# SWEET — project guide for Claude Code
+
+SWEET is a **creative suite**: one shared platform with three pro apps on top — **Visual** (3D modeling/sculpt + graphic design + natural-media paint on one canvas), **Video** (NLE), and **Audio** (DAW). Skin-deep separate, bone-deep shared.
+
+**The load-bearing thesis:** consistency *and* feasibility come from the shared **platform**, not from packaging. You build the hard foundation once; app #2 and #3 inherit the feel, the speed, and half the machinery for free. So: build the Visual app first, and **extract** `platform/*` from it as pieces prove reusable. Never build a speculative framework first.
+
+## Read these first (`docs/`)
+
+- **`docs/01-unified-canvas-architecture.md`** — the Visual app master plan: *what* to build, the object model, the performance doctrine, the toolsets, the build roadmap.
+- **`docs/02-suite-platform-architecture.md`** — the shared platform: how three apps *feel, run, and operate the same*; the platform layers; packaging.
+- **`docs/03-engine-internals-deep-dive.md`** — implementation-grade detail on the four load-bearing subsystems (renderer, raster/brush, object model/undo, timeline/node-graph). **This is the build spec.**
+- **`docs/reference/scenepilot-compositor-reality-check.md`** — the existing video product that becomes `apps/video` (see "The video pillar" below).
+
+When you make a subsystem decision, cite the doc section it comes from (e.g. "per docs/03 §1.3").
+
+## The one invariant
+
+```
+frame = render(evaluate(scene, t))
+```
+
+The **object model is the single source of truth**. The **timeline** mutates it over time. The **node-graph** computes derived data for it. The **raster substrate** stores its pixel payloads. The **renderer** is a *pure readout* of its state at one instant — it owns no truth and never blocks. Hold this and the architecture stays sane.
+
+## Tech stack
+
+- **Rust**, edition 2021 (pinned stable via `rust-toolchain.toml`).
+- **wgpu** for the GPU (one API over Vulkan/Metal/DX12/WebGPU). **winit** for windowing. **glam** for math.
+- **UI framework: DECISION PENDING** — GPUI (polish-first, high starting floor) vs egui (fastest to move, needs heavy styling). See docs/01 §8. Pick before Phase 3 (the shell); Phases 0–2 don't need it.
+- **No external deps are wired yet.** The skeleton compiles offline with zero dependencies. The placeholder math types in `platform/doc` get replaced by `glam` at Phase 0.
+- **Integrate, don't invent:** wrap existing research for the hard kernels — exact-arithmetic booleans, QuadriFlow remesh, SAM segmentation, ONNX runtime, image-to-3D. Do not reimplement these.
+
+## Repo structure
+
+```
+SWEET/
+├── Cargo.toml            # virtual workspace
+├── CLAUDE.md             # this file
+├── rust-toolchain.toml   # pinned stable
+├── docs/                 # the three architecture docs + video reference
+├── design-tokens/        # tokens.toml — the single source of truth for the look (not a crate)
+├── platform/             # built ONCE, linked by every app; grown by extraction from apps/visual
+│   ├── gpu/        # wgpu abstraction, renderer, compositor          (docs/03 §1)
+│   ├── ui/         # shell, panels, docking, command palette         (docs/02 §3.1)
+│   ├── design/     # tokens + component kit (the look)               (docs/02 §3.2)
+│   ├── input/      # pen/mouse, the morphing gizmo, snapping, shortcuts (docs/02 §3.4)
+│   ├── doc/        # object model, command/undo, serialization — THE SPINE (docs/03 §3)
+│   ├── timeline/   # keyframe/track engine — one spine, three faces  (docs/03 §4.1–4.3)
+│   ├── nodes/      # node-graph framework — one spine, three faces   (docs/03 §4.4–4.6)
+│   ├── assets/     # universal project format, asset library, interchange (docs/03 §3.6)
+│   └── services/   # io, color mgmt, prefs, plugin host, licensing, update (docs/02 §3.9)
+└── apps/                 # thin shells: a domain core wired to platform/*
+    ├── visual/     # 3D + design + paint on one canvas — BUILD FIRST  (docs/01)
+    ├── video/      # NLE — converges from COMPOSITOR                  (docs/03 §4.6)
+    └── audio/      # DAW — sibling binary, real-time isolated          (docs/02 §0, §8)
+```
+
+Crate names are `suite-<role>` (e.g. `suite-gpu`, imported in code as `suite_gpu`). Apps are `suite-visual` / `suite-video` / `suite-audio`.
+
+## Build & run
+
+```sh
+cargo build                          # whole workspace
+cargo run --release -p suite-visual  # the Visual app — opens a wgpu window
+cargo check -p suite-doc             # check a single crate
+cargo fmt && cargo clippy            # before committing
+```
+
+## Build roadmap — where we are: **Phase 0-2 + Phase 4 + Tier 1-3 + rigging + undo — CSG booleans, paint-on-3D, animation timeline, predictive snapping, revolve/lathe, path-extrude/pipe, sculpt brushes, decimation, magic-wand, image→3D heightmap, a full rig pipeline (auto-rig → auto-skin → live LBS deform → bone keyframes → animated playback, bones render in the viewport), and document-level command-delta undo/redo unified with paint undo under ⌘Z. Photo pillar: adjustment layers now include Exposure/Vibrance/White-Balance/Posterize/Threshold/Invert + convolution filters Box-Blur/Sharpen/Edge-Detect (clean-room, PhotoDemon-referenced). 57 workspace tests green. Painting pillar: Krita-referenced mirror/symmetry painting (X/Y/4-way), brush tips (Round/Square/Soft), per-stamp blend modes (Normal/Add/Erase), smudge brush, color eyedropper, wrap-around tiling; photo: separable Gaussian blur. 61 workspace tests green. External-code policy: reference/clean-room only — Blender (GPL) and Krita (GPL-3.0) are reference-only (their code would force SWEET to GPL); PhotoDemon (BSD) is a legal algorithm reference. Downloadable macOS build: `scripts/package_macos.sh` → `dist/SweetVisual.app` (self-contained, ad-hoc signed). **Bug fixed: egui shell rendered invisible (font-atlas upload lost to a Skipped first present) — now applied unconditionally before render.** **"GIMP/Photoshop ladder" started — M1 (image open/export via the `image` crate, `suite-visual <file>` import-on-launch, undoable) landed & screenshot-verified. 63 tests. M2 (real raster layer stack: per-layer GPU textures composited bottom→top into the display, + a Layers panel with add/delete/select/visibility/opacity/reorder) landed & screenshot-verified (red+blue layers composite correctly). 63 tests. M2.2 multi-layer .sweet persistence (back-compat with legacy single-blob files) + M2.3 per-layer blend modes (Normal/Multiply/Screen/Overlay/Soft+Hard Light/Add/Subtract via a ping-pong composite) landed & verified (Multiply darkens overlap). 64 tests. **M3: Rect Marquee Selection landed** — RectSelect tool (M key), drag to draw UV-space selection rect; brush stamps GPU-scissored to selection (wgpu `set_scissor_rect`); marching-ants overlay (animated dashed border) on CentralPanel; ⌘A/⌘D shortcuts; inspector with Select All/Deselect/Invert buttons; `scissor_clips_stroke_outside_rect` headless test green. **M4 (Core 2D tools) underway:** Gradient tool (G / "Grd") — drag start→end fills the active layer brush-colour→transparent, Linear or Radial, source-over composite in linear space, respects the active selection, undoable; live guide-line overlay during drag. Layer Transform (inspector) — Flip H/V, Rotate 90° CW/CCW, 180° on the active layer, undoable. Pixel math extracted to pure `apply_gradient_fill` / `apply_layer_transform` fns with 6 headless unit tests. G is context-sensitive (bevels a focused mesh edge, else picks Gradient). 71 workspace tests green. **M4 remaining: crop, bucket-fill polish, text tool. Then M5 (arbitrary canvas size + sparse tiling).**
+
+Sequence so visual design and "feel" always have something real to live on. Each phase is shippable-as-a-demo (docs/01 §9).
+
+- **Phase 0 — Engine spine.** ✅ **LANDED 2026-06-25.** A wgpu renderer draws a colored cube, a triangle, a textured checker quad, and a procedural grid with one camera that toggles perspective ↔ orthographic. Lives in `platform/gpu` + `apps/visual`. CPU+submit fits the 8 ms budget. See [DECISIONS.md §"Phase 0 lands"](DECISIONS.md).
+- **Phase 1 + 3 lite — Document, tool box, shell.** ✅ **LANDED 2026-06-25.** `platform/doc::Document` is real (generational object arena, glam-driven TRS). The renderer reads `&Document`. The Visual app has an egui shell (top bar + left tool strip + right inspector + bottom timeline placeholder), tools (Select/Move/AddCube/AddSphere/AddImage), click-to-select via AABB raycast, transform inspector, and a selection AABB outline. See [DECISIONS.md §"Phase 1 + 3 lite"](DECISIONS.md).
+- **Phase 1 polish — translate gizmo arrows.** ✅ **LANDED 2026-06-25.** Three colored axis arrows render on the selected object; hover highlights, click+drag locks translation to that axis. See [DECISIONS.md §"Translate gizmo"](DECISIONS.md).
+- **Persistence — `.sweet` save/load.** ✅ **LANDED 2026-06-25.** `⌘S`/`⌘O`/`⌘N` + top-bar buttons. `platform/doc` serializes a versioned `sweet.visual.scene`; `platform/assets::ProjectBundle` wraps it in a domain-agnostic `sweet.bundle` container. Fail-closed on unknown schema/future version; generational ids survive the round-trip. 8 tests green. See [DECISIONS.md §"Persistence"](DECISIONS.md).
+- **Persistence — `.sweet` save/load.** ✅ **LANDED 2026-06-25.** `⌘S`/`⌘O`/`⌘N` + top-bar buttons; versioned `sweet.visual.scene` inside a domain-agnostic `sweet.bundle`; fail-closed; 8 tests. See [DECISIONS.md §"Persistence"](DECISIONS.md).
+- **Phase 2 — raster substrate (painting + undo + save).** ✅ **LANDED 2026-06-25.** `Paint` tool (`B`): real GPU brush (size/hardness/flow/opacity/color) on a `PaintCanvas`, rendered into a 1536² texture sampled live. **Undo/redo** (`⌘Z`/`⌘⇧Z`) via dirty-region GPU snapshots. **Painted pixels persist** in `.sweet` (PNG blob). Headless tests prove brush + undo. See [DECISIONS.md §"Paint undo… and the first poly-modeling slice"](DECISIONS.md). Remaining: sparse 256² tiling (for canvases > one texture) + per-tile undo — deferred until size demands it.
+- **Phase 4 — poly modeling, deepening.** ✅ **2026-06-25.** Editable `Mesh` (`ObjectKind::Mesh`, verts + n-gon faces); `Msh`/`6` adds one. **Face selection** (click a face → highlight). **Extrude** (`E`) + **Inset** (`I`) on the focused face, repeatable. **Catmull–Clark subdivision** (`Mesh::catmull_clark`, boundary-aware) turns blocky into smooth. **Non-destructive modifier stack** — `Mirror`/`Array`/`Subdivide` on `Object.modifiers`, evaluated by `Object::display_mesh()` without touching the base; live inspector UI (add/remove/tweak). 9 `suite-doc` tests. See [DECISIONS.md §"The modifier stack + Catmull–Clark"](DECISIONS.md).
+- **Phase 4 — half-edge kernel + loop-cut.** ✅ **LANDED 2026-06-26.** A transient `HalfEdgeMesh` (`platform/doc/halfedge.rs`) built on demand over the indexed `Mesh` — O(1) adjacency via `twin`/`next`/`prev`. Traversals `edge_ring` + `edge_loop` (the basis for ring/loop select and every remaining hard-surface op). **Loop cut** (`Mesh::loop_cut`, `Document::loop_cut_selected_mesh`, `C` hotkey + inspector button): drops a midpoint loop through a quad strip, splitting each crossed quad. **Bevel** (`Mesh::bevel_vertex` via `vertex_fan`, `Document::bevel_selected_mesh_corner`, `V` hotkey + button): truncates a corner into a cap face. 18 `suite-doc` tests; 25 workspace. See [DECISIONS.md §"The half-edge mesh kernel + loop-cut"](DECISIONS.md) + [§"Bevel"](DECISIONS.md). **Next ← :** edge bevel, exact-arithmetic booleans, paint-on-3D.
+- **Phase 2 — Raster substrate** (`platform/gpu` + a raster module): 256×256 tiles, brush→mask, live/committed layers, dirty-tile undo.
+- **Phase 3 — The shell** (`platform/ui` + `platform/design`): charcoal chrome, the contextual right panel, the universal timeline. Pick the UI framework here.
+- **Phase 4** — 3D modeling (poly edit + modifier stack). **Phase 5** — sculpting. **Phase 6** — graphic design. **Phase 7** — the unifiers (2D→3D, paint-on-3D, magnet snapping). **Phase 8** — rigging + animation. **Phase 9** — ML milestones (Select Subject, image→3D, auto-rig).
+
+## Laws — do not violate (they are what make the suite feel like one product)
+
+**Performance doctrine** (docs/01 §2, docs/03 §1.9) — *instant or it didn't ship:*
+- Input → on-screen result in **< ~8 ms**, every frame. Anything slower runs async and streams its result back.
+- **Never block the UI thread.** Heavy work (booleans, fills, ML, decimation, big blurs) goes to compute/worker; preview live, commit atomically.
+- **Pixels live on the GPU and stay there.** No per-stroke CPU↔GPU round-trips. No readback in the input→draw path.
+- **Tiles, always** (256×256). Only touch tiles under the brush. Infinite canvas = sparse tile map.
+- **Dirty-tile undo, not full snapshots.** Copy only the few tiles a stroke dirtied.
+- **Minimal swapchain buffering.** Measure pen-to-photon early with the real windowing layer.
+
+**Document & evaluation discipline** (docs/03 §3–4):
+- **Undo = command-delta** (apply/revert), never document snapshots. A user action = one transaction. Coalesce live drags into one step.
+- **Evaluation = lazy pull + dirty-propagate + cache,** everywhere — modifier stacks, node graphs, adjustment-layer compositor. One philosophy across the engine.
+- **Compositing order ≠ depth order.** 2D design layers composite in explicit stack order; 3D geometry uses depth/OIT. Never conflate them.
+- **Generational IDs** for every object — stable across edits and saves; a stale id fails lookup, never aliases.
+
+**Product laws:**
+- **"No modes."** One canvas; tools morph to the selection. Do not add a 2D/3D mode switch — the engine slips between ortho and perspective; the user never toggles it (docs/01 §0, docs/03 §1.5).
+- **Color: one shared layer.** Linear, wide-gamut working space; all blending in linear; visual and video share the exact same color management (docs/03 §1.8). Design it before the second object type exists.
+- **Keep apps thin.** Domain cores live in `apps/*`; shared machinery lives in `platform/*`. If two apps would use it, it belongs in the platform — *but only extract on the second real use,* never speculatively (docs/02 §8).
+
+## The video pillar (`apps/video`)
+
+**Decision (confirmed):** the existing **ScenePilot + COMPOSITOR** product *becomes* the suite's video app. Today it is **C++/Qt + FFmpeg** (external repo: `scenepilot-compositor-main`). Two reconciliations are open:
+
+1. **Shell/language:** C++/Qt today → a Rust/wgpu app on this shared platform. Likely path: keep COMPOSITOR's *model and logic* as the design reference, rebuild the shell on `platform/ui` + `platform/design`, port incrementally.
+2. **Render:** the FFmpeg executor (**Fork B** — ships now, retires the export blocker) → the **native GPU compositor** this platform's node-graph specs (**Fork A**, docs/03 §4.6) later, justified only where it differentiates (live GPU preview, real-time effects). The **editplan contract** is the swappable seam between them.
+
+**Reuse from COMPOSITOR:** the `Project → Composition → Layer` model, undo/redo, SQLite crash-safe save, OTIO + `scenepilot.editplan.v0` interchange, and ScenePilot's beat/cut analysis. **Rebuild on the platform:** shell, design system, GPU foundation, the timeline engine, the node-graph. A full convergence plan is the natural next doc — not yet written.
+
+## Status & immediate next steps
+
+- **Status:** Phase 0–2 + Phase 4 deepening — `cargo run --release -p suite-visual`. Tool box (Select/Move/**Paint**/AddCube/AddSphere/AddImage/**AddMesh**; hotkeys 1/2/**B**/3/4/5/**6**), inspector (objects + transform + brush + **mesh ops + modifier stack**), top bar New/Open/Save/Save-As + frame budget. **Paint**: real GPU brush, **`⌘Z`/`⌘⇧Z` undo/redo**, pixels **save** in `.sweet` (PNG blob). **3D**: select objects (raycast) + **mesh faces** (click), translate gizmo, **extrude `E` / inset `I`** the focused face, **Catmull–Clark subdivision** + a **non-destructive modifier stack** (Mirror/Array/Subdivide, live in the inspector). One canvas holds paint + primitives + editable mesh. UI: **egui 0.35**. Deps add `png 0.18`/`base64 0.22`. **13 workspace tests green** (incl. headless brush + undo readback, CC subdivision counts/smoothing, modifier-stack non-destructive round-trip, face-pick + extrude).
+- **Next:** mesh **face/edge/vertex selection** (click-pick a face → extrude *that* face), then **inset/bevel + the modifier stack**; sparse raster tiling when canvas size demands it. The PS+Blender+C4D goal remains many sessions out — every track now has a tested foundation.
+
+## Working agreements for agents
+
+- Respect the laws above; cite the doc section behind each subsystem decision.
+- Grow `platform/*` by **extraction** from `apps/visual`; don't over-abstract before a second consumer exists.
+- The placeholder types (e.g. `Mat4` in `platform/doc`) are intentional — replace with `glam` at Phase 0, don't build a math library.
+- Update this file's **Status** and **roadmap** markers as phases land, so the next session opens with an accurate picture.
