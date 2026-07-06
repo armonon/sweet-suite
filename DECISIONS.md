@@ -1332,3 +1332,22 @@ Directly unblocked by M5: crop is exactly "resize the canvas + offset layers", a
 Same system-level Screen Recording/Automation permission issue as M5 — briefly cleared mid-session (one real screenshot went through) then reverted to black frames once another Claude session took the computer-use lock, confirmed by the returned image being byte-identical in size to the earlier failure. Relied on the automated suite again rather than claim an interactive check (drag a selection, click Crop, confirm the canvas actually shrinks) that didn't happen. Owed once the lock/permission situation is clear.
 
 Next: remaining M4 (text tool, free transform), then Tier 1 (selection mask + lasso/poly/wand/feather).
+
+---
+
+## "Make sure we have all Photoshop tools" — audit + M4d: Move (2D) — 2026-07-06
+
+Armon: "make sure we have all photoshop tools." Honest answer first, not a demo: **SWEET doesn't, and several missing families are each real, multi-day projects on their own** — pen/vector shapes, healing/clone/history-brush, dodge/burn/sponge, mixer brush, content-aware fill. Built a complete tool-by-tool checklist against SWEET's actual code (not memory) and put it in ROADMAP.md rather than make a vague claim either way — see "Photoshop tool-parity checklist" there for the full table. Then shipped the single highest-value, tractable gap: the **Move** tool, arguably Photoshop's most-used tool, which had zero SWEET equivalent (`Translate` only moves 3D scene objects).
+
+### What shipped
+- **Pure fns** (`platform/gpu/src/lib.rs`): `shift_pixels(src, w, h, dx, dy)` — whole-buffer shift, drops content pushed off-canvas, reveals transparent at the vacated edge (no wrap-around). `move_selection_pixels(src, w, h, sel_x0, sel_y0, sel_w, sel_h, dx, dy)` — cuts the selection region out (leaving a true transparent hole, not just a copy), then alpha-composites it back at the shifted position in **linear** space (reusing the same `srgb_to_linear`/`linear_to_srgb` helpers `apply_gradient_fill` established).
+- **`Renderer::move_active_layer(dx, dy) -> Option<[f32;4]>`**: reads the active selection rect (if any), converts to texel bounds, dispatches to `move_selection_pixels` or `shift_pixels`, writes back as **one** undoable edit. Dimension-preserving, so it's safe on any canvas aspect (M5) with no special-casing needed. Returns the selection's new UV rect (if there was one) so the caller can move the marching-ants to follow the content, matching Photoshop's behaviour.
+- **`Tool::MoveLayer`** ("MovL" in the tool strip, hotkey **V** — Photoshop's actual Move shortcut, context-sensitive like G: bevels a focused mesh corner if one exists, else picks Move). Drag-to-preview, **commit-on-release** — the same shape as the Gradient tool (a guide line + end-cap handles during the drag; the canvas itself doesn't change until release, so there's no need to juggle live per-frame GPU writes against the undo/redo-clearing behaviour `RasterCanvas::upload_rgba` has (a real footgun considered and avoided: plain `upload_rgba` unconditionally clears both undo AND redo, so a naive live-preview-every-frame design would have silently destroyed its own undo entry on the very next preview frame).
+
+### Testing
+2 new tests: `shift_pixels_moves_content_and_reveals_transparent_edges` (confirms drop-not-wrap + transparent reveal), `move_selection_pixels_cuts_a_hole_and_pastes_at_the_new_spot` (confirms the original spot becomes a genuine transparent hole, not stale background, and the destination shows the moved content). 78 workspace tests green.
+
+### Verification gap continues
+Same Screen Recording/Automation permission story as M5 and Crop: blocked by another Claude session holding the computer-use lock for the whole increment. Packaged the app anyway; a live check (drag to move a layer, then with a selection active, confirm the hole + the marching-ants follow the moved content) is still owed.
+
+Next: remaining M4 (text tool, free transform), then Tier 1 (selection mask — the piece that unlocks Elliptical Marquee, Lasso, Quick Selection, Quick Mask, and layer masks all at once).

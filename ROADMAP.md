@@ -28,6 +28,7 @@ These are table-stakes; their absence is the first thing a Photoshop user notice
 | M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | L | Font-file **byte parsing** (pure format decode) is fine to depend on; hand-build the layout/kerning/rasterization on top ourselves. Start: single-line Latin, font/size/color, rasterize to active layer — defer full Unicode shaping/bidi/complex scripts. |
 | M4b | ~~**Crop**~~ **DONE 2026-07-06** | Trivially expected; unblocked by M5's canvas-resize machinery. | S | Shipped: `Renderer::crop_to_rect` reuses M3's rect selection as the crop source + M5's drain-and-recreate pattern. "Crop to Selection" in the RectSelect inspector. See DECISIONS.md. |
 | M4c | **Free transform** (scale/rotate/skew of layer or selection) | Only flip/rotate-90 exists today. | M | Affine warp of the layer's pixels + a handle gizmo. |
+| M4d | ~~**Move (2D)**~~ **DONE 2026-07-06** | Photoshop's most-used tool had no SWEET equivalent. | S–M | Shipped: `Tool::MoveLayer` ("MovL", **V**), commit-on-release like Gradient. Selection-aware: with a selection active, only that region moves (leaving a transparent hole); with none, the whole layer shifts. See DECISIONS.md. |
 
 ## Tier 1 — selections & non-destructive editing (do next)
 
@@ -78,3 +79,54 @@ Tier 3  (unified)    → depth/color passes → render-to-layer → local AI bri
 Rationale: Tiers 0–1 make SWEET a _credible_ 2D editor; Tier 2 makes it a _connectable_
 3D tool; Tier 3 is the moat. Ship Tier 0 before anything glamorous — a text tool and
 arbitrary canvas size buy more credibility than a path tracer.
+
+## Photoshop tool-parity checklist (2026-07-06)
+
+Armon asked to make sure SWEET has "all Photoshop tools." Honest answer up front: **it
+doesn't, and several missing families (pen/vector shapes, healing/clone/history-brush,
+dodge/burn/sponge, mixer brush, content-aware fill) are each real, multi-day undertakings
+on their own** — this is Photoshop's entire toolbox, not a small ask. This checklist exists
+so nothing gets silently dropped or double-counted against the tiers above. ✅ have · 🟡
+partial/different semantics · ⬜ gap, with the effort tier it'd land in.
+
+| Photoshop tool (toolbar group) | SWEET state | Where it'd land |
+|---|---|---|
+| Move | ✅ `Tool::MoveLayer` (M4d, 2026-07-06) | — |
+| Rectangular Marquee | ✅ `RectSelect` (M3) | — |
+| Elliptical / Row / Column Marquee | ⬜ needs a real per-pixel mask, not a bounding-rect scissor | Tier 1 (S1 first) |
+| Lasso / Polygonal / Magnetic Lasso | ⬜ | Tier 1 (S2) |
+| Quick Selection | ⬜ | Tier 1 (S2) |
+| Magic Wand | 🟡 have — but it directly flood-fills, doesn't produce a reusable selection like Photoshop's | Tier 1 (S2) retargets it |
+| Crop | ✅ `crop_to_rect` (M4b) | — |
+| Perspective Crop / Slice / Frame | ⬜ niche | Not scheduled |
+| Eyedropper | ✅ | — |
+| Color Sampler / Ruler / Note / Count | ⬜ niche | Not scheduled |
+| Spot Healing / Healing / Patch / Content-Aware Move / Red Eye | ⬜ — needs inpainting-style algorithms | Large, own future tier |
+| Brush | ✅ — tips, hardness/flow/pressure, stabilizer, symmetry, wrap, blend modes | — |
+| Pencil | 🟡 — achievable today as Brush at hardness=1 | Not scheduled |
+| Color Replacement | ⬜ | Medium |
+| Mixer Brush | ⬜ — real wet-paint blending | Large |
+| Clone Stamp / Pattern Stamp | ⬜ | Medium — next highest-value gap after Move |
+| History Brush / Art History Brush | ⬜ — needs "paint from a prior undo state" | Large (new architecture) |
+| Eraser | ✅ `BrushBlend::Erase` | — |
+| Background Eraser / Magic Eraser | 🟡 partial overlap with Magic Wand→transparent | Small once S2 lands |
+| Gradient | ✅ (M4) | — |
+| Paint Bucket | 🟡 Magic Wand's flood-fill covers this | Small: flat-fill-selection variant |
+| Blur / Sharpen / Smudge (drag brush) | 🟡 Smudge ✅ (brush param); Blur/Sharpen exist only as full-image adjustment filters, not a localized drag brush | Medium |
+| Dodge / Burn / Sponge | ⬜ — brush-based tonal ops | Medium |
+| Pen / Freeform / Curvature / anchor points | ⬜ — no vector-path architecture at all | Large, own future tier |
+| Type | ⬜ | M4a (tracked, effort L) |
+| Path/Shape Selection | N/A without vector paths | — |
+| Shape tools (rect/ellipse/polygon/line/custom) | ⬜ as vector layers — SWEET's Add-Cube/Sphere/etc are 3D primitives, not 2D vector shapes | Large |
+| Hand / Zoom / Rotate View | 🟡 — arrow-key orbit + ±zoom (3D camera) covers the 3D case; no dedicated 2D pan/zoom-drag tool | Small |
+| Free Transform | ⬜ | M4c (tracked, effort M) |
+| FG/BG color swatches + swap | ⬜ — one brush colour, no background swatch | Small |
+| Quick Mask mode | ⬜ | Tier 1, once S1 lands |
+
+**Bottom line:** SWEET covers the core paint/select/gradient/eyedropper/crop path solidly,
+but is missing entire tool *families* — healing/clone/history-brush, dodge/burn/sponge,
+mixer brush, pen/vector shapes, content-aware fill — each of which is its own real
+project, not a quick add. The single highest-leverage next step is **Tier 1's selection
+mask** (S1): it's the one piece of infrastructure that unlocks Elliptical Marquee, Lasso,
+Polygonal Lasso, Quick Selection, Quick Mask, and layer masks all at once, rather than
+being one more one-off tool.

@@ -351,6 +351,107 @@ pub fn crop_pixels(src: &[u8], src_width: usize, src_height: usize, x0: usize, y
     dst
 }
 
+/// **Pure** whole-layer shift by `(dx, dy)` texels. Texels that would land off-canvas are
+/// dropped; the newly-revealed edge is transparent. Used by `Renderer::move_active_layer`
+/// (M4) when there's no active selection — Photoshop's Move tool with nothing selected
+/// moves the whole layer the same way.
+pub fn shift_pixels(src: &[u8], width: usize, height: usize, dx: i32, dy: i32) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    for y in 0..height {
+        let ny = y as i32 + dy;
+        if ny < 0 || ny >= height as i32 {
+            continue;
+        }
+        for x in 0..width {
+            let nx = x as i32 + dx;
+            if nx < 0 || nx >= width as i32 {
+                continue;
+            }
+            let si = (y * width + x) * 4;
+            let di = (ny as usize * width + nx as usize) * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    dst
+}
+
+/// **Pure** selection-aware move: cuts the `(sel_x0, sel_y0, sel_w, sel_h)` region out of
+/// `src` (leaving it transparent), then alpha-composites (in **linear** space, since the
+/// buffer is sRGB-encoded) that region back at `(sel_x0+dx, sel_y0+dy)`, clipped to canvas
+/// bounds. Used by `Renderer::move_active_layer` (M4) when a selection is active —
+/// Photoshop's Move tool with an active selection only moves the selected pixels, leaving
+/// a transparent hole behind.
+pub fn move_selection_pixels(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    sel_x0: usize,
+    sel_y0: usize,
+    sel_w: usize,
+    sel_h: usize,
+    dx: i32,
+    dy: i32,
+) -> Vec<u8> {
+    let region = crop_pixels(src, width, height, sel_x0, sel_y0, sel_w, sel_h);
+    let mut dst = src.to_vec();
+
+    // Clear the original selection region to transparent.
+    let clear_w = sel_w.min(width.saturating_sub(sel_x0));
+    for y in 0..sel_h {
+        let row = sel_y0 + y;
+        if row >= height {
+            break;
+        }
+        let row_start = (row * width + sel_x0) * 4;
+        for i in 0..clear_w {
+            let p = row_start + i * 4;
+            dst[p..p + 4].copy_from_slice(&[0, 0, 0, 0]);
+        }
+    }
+
+    // Composite the cut region back at the shifted position, source-over in linear space.
+    for y in 0..sel_h {
+        let ny = sel_y0 as i32 + y as i32 + dy;
+        if ny < 0 || ny >= height as i32 {
+            continue;
+        }
+        for x in 0..sel_w {
+            let nx = sel_x0 as i32 + x as i32 + dx;
+            if nx < 0 || nx >= width as i32 {
+                continue;
+            }
+            let si = (y * sel_w + x) * 4;
+            let sa = region[si + 3] as f32 / 255.0;
+            if sa <= 0.0 {
+                continue;
+            }
+            let sr = srgb_to_linear(region[si] as f32 / 255.0);
+            let sg = srgb_to_linear(region[si + 1] as f32 / 255.0);
+            let sb = srgb_to_linear(region[si + 2] as f32 / 255.0);
+            let di = (ny as usize * width + nx as usize) * 4;
+            let da = dst[di + 3] as f32 / 255.0;
+            let dr = srgb_to_linear(dst[di] as f32 / 255.0);
+            let dg = srgb_to_linear(dst[di + 1] as f32 / 255.0);
+            let db = srgb_to_linear(dst[di + 2] as f32 / 255.0);
+            let oa = sa + da * (1.0 - sa);
+            let (or_, og, ob) = if oa > 1e-6 {
+                (
+                    (sr * sa + dr * da * (1.0 - sa)) / oa,
+                    (sg * sa + dg * da * (1.0 - sa)) / oa,
+                    (sb * sa + db * da * (1.0 - sa)) / oa,
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            dst[di] = (linear_to_srgb(or_).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 1] = (linear_to_srgb(og).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 2] = (linear_to_srgb(ob).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    dst
+}
+
 /// Drives the translate-gizmo draw. The renderer reads this once per frame; nothing is
 /// retained across frames.
 #[derive(Clone, Copy, Debug)]
@@ -1799,6 +1900,47 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
+    /// **M4: Move.** Drag-offset the active layer's pixels by `(dx, dy)` texels. With an
+    /// active selection, only the selected pixels move (leaving a transparent hole, same as
+    /// Photoshop's Move tool with a selection active); with none, the whole layer shifts.
+    /// Dimension-preserving, so it's always safe regardless of canvas aspect (M5) — a single
+    /// undoable edit (commit-on-release; see `apps/visual`'s Move tool for the drag UX).
+    ///
+    /// Returns the new selection rect in UV space (clamped to canvas bounds) if a selection
+    /// was active, so the caller can update the on-screen marching-ants immediately.
+    pub fn move_active_layer(&mut self, dx: i32, dy: i32) -> Option<[f32; 4]> {
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
+        let src = self.read_active_layer_rgba();
+
+        let sel_texel = self.selection_rect.and_then(|[x0, y0, x1, y1]| {
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            let sx0 = ((x0 * w as f32).floor() as usize).min(w.saturating_sub(1));
+            let sy0 = ((y0 * h as f32).floor() as usize).min(h.saturating_sub(1));
+            let sw = (((x1 * w as f32).ceil() as usize).saturating_sub(sx0)).max(1);
+            let sh = (((y1 * h as f32).ceil() as usize).saturating_sub(sy0)).max(1);
+            Some((sx0, sy0, sw, sh))
+        });
+
+        let (dst, new_selection_uv) = match sel_texel {
+            Some((sx0, sy0, sw, sh)) => {
+                let moved = move_selection_pixels(&src, w, h, sx0, sy0, sw, sh, dx, dy);
+                let nx0 = (sx0 as i32 + dx).clamp(0, w as i32) as f32 / w as f32;
+                let ny0 = (sy0 as i32 + dy).clamp(0, h as i32) as f32 / h as f32;
+                let nx1 = ((sx0 + sw) as i32 + dx).clamp(0, w as i32) as f32 / w as f32;
+                let ny1 = ((sy0 + sh) as i32 + dy).clamp(0, h as i32) as f32 / h as f32;
+                (moved, Some([nx0, ny0, nx1, ny1]))
+            }
+            None => (shift_pixels(&src, w, h, dx, dy), None),
+        };
+        self.write_active_layer_undoable(&dst);
+        new_selection_uv
+    }
+
     /// **M4: Crop.** Crop the whole document to the UV-space rect `[x0, y0, x1, y1]` (every
     /// layer + the comp/display buffers together, so they stay aligned — same reasoning as
     /// `rotate_canvas_90`). Not undoable (a structural resize). No-op if the rect is
@@ -2955,7 +3097,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, rotate_canvas_pixels, LayerTransform};
+    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, move_selection_pixels, rotate_canvas_pixels, shift_pixels, LayerTransform};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -3052,6 +3194,49 @@ mod m4_tests {
         // Clamped to the 2×2 that actually exists from (6,6) to (8,8).
         assert_eq!(out.len(), 2 * 2 * 4);
         assert_eq!(px(&out, 2, 0, 0), px(&src, w, 6, 6));
+    }
+
+    /// M4 Move (no selection): shifting the whole layer relocates every pixel by (dx,dy);
+    /// the revealed edge is transparent, and shifted-off pixels are dropped, not wrapped.
+    #[test]
+    fn shift_pixels_moves_content_and_reveals_transparent_edges() {
+        let (w, h) = (8, 8);
+        let src = ramp(w, h);
+        let out = shift_pixels(&src, w, h, 2, 1);
+        // Source (0,0) should now be at (2,1).
+        assert_eq!(px(&out, w, 2, 1), px(&src, w, 0, 0));
+        // The revealed strip at x=0..2 (nothing shifted into it) is fully transparent.
+        assert_eq!(px(&out, w, 0, 4), [0, 0, 0, 0]);
+        // A pixel shifted off the right edge (x=7 -> x=9, out of bounds) is simply dropped —
+        // it does not wrap around to reappear at x=1.
+        assert_eq!(px(&out, w, 1, 1), [0, 0, 0, 0]);
+    }
+
+    /// M4 Move (with a selection): only the selected region relocates; it leaves a
+    /// transparent hole behind, and the destination shows the moved content, not the old
+    /// background alpha-blended incorrectly.
+    #[test]
+    fn move_selection_pixels_cuts_a_hole_and_pastes_at_the_new_spot() {
+        let (w, h) = (10, 10);
+        // Opaque black background, with an opaque white 3x3 block at (2,2)-(5,5).
+        let mut src = vec![0u8; w * h * 4];
+        for p in src.chunks_exact_mut(4) {
+            p[3] = 255;
+        }
+        for y in 2..5 {
+            for x in 2..5 {
+                let i = (y * w + x) * 4;
+                src[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        // Move that 3x3 selection by (+4, 0).
+        let out = move_selection_pixels(&src, w, h, 2, 2, 3, 3, 4, 0);
+        // The original spot is now a transparent hole (not black background — genuinely cut).
+        assert_eq!(px(&out, w, 3, 3), [0, 0, 0, 0], "original selection spot is a hole");
+        // The new spot (2+4, 2) through (5+4-1, 4) shows the moved white block.
+        assert_eq!(px(&out, w, 6, 3)[0], 255, "moved content lands at the new spot");
+        // Untouched background elsewhere is still opaque black.
+        assert_eq!(px(&out, w, 0, 0), [0, 0, 0, 255]);
     }
 
     #[test]

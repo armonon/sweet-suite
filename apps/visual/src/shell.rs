@@ -101,6 +101,9 @@ pub struct ShellState {
     /// Live gradient guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
     /// before each frame so the overlay can draw the drag line.
     pub gradient_preview: Option<[f32; 4]>,
+    /// Live Move-tool guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
+    /// before each frame so the overlay can draw the drag line.
+    pub move_preview: Option<[f32; 4]>,
     /// Set by the inspector flip/180° buttons; drained in main.rs to call the renderer.
     /// Always dimension-preserving — safe regardless of canvas aspect ratio (M5).
     pub pending_layer_transform: Option<suite_gpu::LayerTransform>,
@@ -152,6 +155,7 @@ impl Default for ShellState {
             selection_rect: None,
             gradient_radial: false,
             gradient_preview: None,
+            move_preview: None,
             pending_layer_transform: None,
             pending_canvas_rotate: None,
             pending_crop: None,
@@ -396,6 +400,7 @@ pub fn draw_shell(
                     (Tool::Paint, "Pnt", "B"),
                     (Tool::RectSelect, "Mrq", "M"),
                     (Tool::Gradient, "Grd", "G"),
+                    (Tool::MoveLayer, "MovL", "V"),
                     (Tool::AddCube, "Cub", "3"),
                     (Tool::AddSphere, "Sph", "4"),
                     (Tool::AddImage, "Img", "5"),
@@ -431,7 +436,7 @@ pub fn draw_shell(
                     if resp.clicked() {
                         match tool {
                             Tool::Select | Tool::Translate | Tool::Paint
-                            | Tool::RectSelect | Tool::Gradient | Tool::Eyedropper => {
+                            | Tool::RectSelect | Tool::Gradient | Tool::MoveLayer | Tool::Eyedropper => {
                                 state.tool = tool
                             }
                             Tool::AddCube => {
@@ -1474,6 +1479,21 @@ pub fn draw_shell(
         let rect = canvas_rect;
         let p0 = egui::pos2(rect.left() + gu0 * rect.width(), rect.top() + gv0 * rect.height());
         let p1 = egui::pos2(rect.left() + gu1 * rect.width(), rect.top() + gv1 * rect.height());
+        painter.line_segment([p0, p1], egui::Stroke::new(3.0, egui::Color32::BLACK));
+        painter.line_segment([p0, p1], egui::Stroke::new(1.5, egui::Color32::WHITE));
+        painter.circle_filled(p0, 4.0, egui::Color32::WHITE);
+        painter.circle_stroke(p0, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+        painter.circle_filled(p1, 4.0, egui::Color32::WHITE);
+        painter.circle_stroke(p1, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+    }
+
+    // Move guide line while dragging (start → endpoint), with end caps. The canvas itself
+    // doesn't change until release (commit-on-release, same shape as Gradient) — this line
+    // is the only feedback during the drag.
+    if let Some([mu0, mv0, mu1, mv1]) = state.move_preview {
+        let rect = canvas_rect;
+        let p0 = egui::pos2(rect.left() + mu0 * rect.width(), rect.top() + mv0 * rect.height());
+        let p1 = egui::pos2(rect.left() + mu1 * rect.width(), rect.top() + mv1 * rect.height());
         painter.line_segment([p0, p1], egui::Stroke::new(3.0, egui::Color32::BLACK));
         painter.line_segment([p0, p1], egui::Stroke::new(1.5, egui::Color32::WHITE));
         painter.circle_filled(p0, 4.0, egui::Color32::WHITE);

@@ -570,6 +570,28 @@ impl ApplicationHandler for App {
                             self.input.gradient_preview = None;
                             self.shell.gradient_preview = None;
                         }
+                        // Move: commit the pixel offset from the recorded drag on release.
+                        if self.shell.tool == tools::Tool::MoveLayer {
+                            if let Some([u0, v0, u1, v1]) = self.input.move_preview {
+                                let (cw, ch) = (renderer.canvas_width() as f32, renderer.canvas_height() as f32);
+                                let dx = ((u1 - u0) * cw).round() as i32;
+                                let dy = ((v1 - v0) * ch).round() as i32;
+                                // Skip a zero-pixel drag (a click without a drag).
+                                if dx != 0 || dy != 0 {
+                                    if let Some(new_sel) = renderer.move_active_layer(dx, dy) {
+                                        self.shell.selection_rect = Some(new_sel);
+                                        self.input.select_rect = Some(new_sel);
+                                        renderer.selection_rect = Some(new_sel);
+                                    }
+                                    self.undo_order.push(UndoKind::Paint);
+                                    self.redo_order.clear();
+                                    self.shell.dirty = true;
+                                }
+                            }
+                            self.input.move_drag_start = None;
+                            self.input.move_preview = None;
+                            self.shell.move_preview = None;
+                        }
                         // Inlined end_canvas_edit (disjoint fields; `renderer` is borrowed).
                         if self.canvas_edit_active {
                             let committed = self.document.commit();
@@ -785,11 +807,16 @@ impl ApplicationHandler for App {
                         }
                     }
                     KeyCode::KeyV => {
-                        // Bevel (chamfer) a corner of the selected mesh's focused face.
+                        // Context-sensitive, same pattern as G: with a focused mesh corner,
+                        // bevel it (modeling). Otherwise V selects the 2D Move tool — matching
+                        // Photoshop's actual Move shortcut. The "MovL" tool-strip button is the
+                        // unambiguous path when a mesh is also selected.
                         if self.document.bevel_selected_mesh_corner() {
                             self.shell.dirty = true;
-                            window.request_redraw();
+                        } else {
+                            self.shell.tool = tools::Tool::MoveLayer;
                         }
+                        window.request_redraw();
                     }
                     KeyCode::KeyG => {
                         // Context-sensitive: with a focused mesh edge, bevel it (modeling).
@@ -897,6 +924,8 @@ impl ApplicationHandler for App {
                 renderer.selection_rect = self.shell.selection_rect;
                 // Gradient guide line: input → shell so the overlay can draw the drag.
                 self.shell.gradient_preview = self.input.gradient_preview;
+                // Move guide line: same sync.
+                self.shell.move_preview = self.input.move_preview;
 
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let full_output = self.egui_context.run_ui(raw_input, |ui| {

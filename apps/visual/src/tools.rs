@@ -21,6 +21,7 @@ pub enum Tool {
     Paint,
     RectSelect,
     Gradient,
+    MoveLayer,
     AddCube,
     AddSphere,
     AddImage,
@@ -40,6 +41,7 @@ impl Tool {
             Self::Paint => "Paint",
             Self::RectSelect => "Rect Select",
             Self::Gradient => "Gradient",
+            Self::MoveLayer => "Move Layer",
             Self::AddCube => "Add Cube",
             Self::AddSphere => "Add Sphere",
             Self::AddImage => "Add Image Plane",
@@ -58,6 +60,7 @@ impl Tool {
             Self::Paint => "Drag on a Paint Canvas or directly on a 3D mesh to paint. Tune the brush in the inspector. Try the flat (ortho) view for a face-on artboard.",
             Self::RectSelect => "Drag to draw a selection rectangle on the canvas. Paint only affects pixels inside. ⌘A=all · ⌘D=deselect.",
             Self::Gradient => "Drag on the canvas to fill the active layer with a gradient from the brush colour to transparent (or pick endpoints in the inspector). Linear or radial. Respects the active selection. G to activate.",
+            Self::MoveLayer => "Drag on the canvas to move the active layer's pixels. With an active selection, only the selected pixels move (leaving a transparent hole). V to activate.",
             Self::AddCube => "Adds a unit cube where you click and selects it.",
             Self::AddSphere => "Adds a unit sphere where you click and selects it.",
             Self::AddImage => "Adds a textured image plane where you click and selects it.",
@@ -129,6 +132,13 @@ pub struct InputState {
     /// Live gradient endpoints `[u0, v0, u1, v1]` in UV space while dragging — drawn as a
     /// guide line in the overlay. Cleared on release after the fill commits.
     pub gradient_preview: Option<[f32; 4]>,
+    /// Move tool drag: start UV `[u, v]` set on press; live endpoint follows the cursor.
+    /// Same commit-on-release shape as Gradient — the canvas doesn't change until release,
+    /// only a guide line/handles draw during the drag.
+    pub move_drag_start: Option<[f32; 2]>,
+    /// Live move endpoints `[u0, v0, u1, v1]` in UV space while dragging — drawn as a guide
+    /// line in the overlay. Cleared on release after the move commits.
+    pub move_preview: Option<[f32; 4]>,
 }
 
 /// Krita-referenced symmetry painting: given a brush segment in UV space, return the
@@ -431,6 +441,20 @@ pub fn handle_cursor_moved(
         return;
     }
 
+    // Held drag — Move: track the live endpoint for the overlay guide line. Same
+    // commit-on-release shape as Gradient — no canvas write happens until release.
+    if shell.tool == Tool::MoveLayer && input.left_pressed {
+        let (l, t, r, b) = shell.canvas_rect(renderer.size());
+        let cw = (r - l).max(1.0);
+        let ch = (b - t).max(1.0);
+        let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+        let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+        if let Some([u0, v0]) = input.move_drag_start {
+            input.move_preview = Some([u0, v0, u, v]);
+        }
+        return;
+    }
+
     // Held drag — Paint: stamp from the last UV to the current one so fast strokes
     // stay continuous. Stabilizer smooths the cursor. Canvas path first, then mesh.
     if shell.tool == Tool::Paint {
@@ -619,6 +643,16 @@ pub fn handle_left_press(
             let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
             input.gradient_drag_start = Some([u, v]);
             input.gradient_preview = Some([u, v, u, v]);
+        }
+        Tool::MoveLayer => {
+            // Record the move start point in UV; the drag previews the offset, release commits.
+            let (l, t, r, b) = canvas;
+            let cw = (r - l).max(1.0);
+            let ch = (b - t).max(1.0);
+            let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+            let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+            input.move_drag_start = Some([u, v]);
+            input.move_preview = Some([u, v, u, v]);
         }
         Tool::Paint => {
             // Stamp a single dab where the press landed; the drag continues the stroke.
