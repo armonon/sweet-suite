@@ -4,9 +4,14 @@ _Ordering principle: close the gaps whose **absence makes SWEET feel broken** fi
 interop, then depth, then amplify the one thing neither Photoshop nor Blender does (the
 unified 2D+3D canvas). Effort is a rough T-shirt size._
 
-_License rule (hard): only MIT/Apache/BSD/Zlib crates may be vendored. GPL/AGPL code
-(Blender, Krita, A3D, GIMP) is **reference-only, clean-room**. Candidate crates below are
-pre-checked for permissive licenses._
+_Build posture: **clean-room by default.** Product-differentiating logic — text layout,
+mesh import/export mapping, shading models, mesh/UV algorithms, selection & paint logic —
+is hand-built, informed only by *reading* how other projects solve it, never by copying
+code, regardless of license. External crates stay reserved for pure plumbing with no
+creative logic of its own (GPU/OS bindings, serialization, raw image/font-file byte
+decoding) — the ones already in the workspace (wgpu, winit, glam, serde, rfd, image, png)
+fit that description. GPL/AGPL sources (Blender, Krita, A3D, GIMP) remain hard-blocked from
+vendoring on top of that, as always — reference-only._
 
 _Last updated: 2026-06-29._
 
@@ -19,7 +24,7 @@ These are table-stakes; their absence is the first thing a Photoshop user notice
 | # | Item | Why it matters | Effort | Notes |
 |---|---|---|---|---|
 | M5 | **Arbitrary canvas size** | Fixed square surface is the single most glaring limit — real images aren't 256². | M | Wire the existing 256² `TileCanvas` sparse substrate as the main surface; decouple width≠height. |
-| M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | M–L | `cosmic-text` + `glyphon` (both MIT/Apache) for shaping/atlas. Start: single-line, font/size/color, rasterize to active layer. |
+| M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | L | Font-file **byte parsing** (pure format decode) is fine to depend on; hand-build the layout/kerning/rasterization on top ourselves. Start: single-line Latin, font/size/color, rasterize to active layer — defer full Unicode shaping/bidi/complex scripts. |
 | M4b | **Crop** | Trivially expected; pairs with M5. | S | Crop = resize canvas + offset layers. |
 | M4c | **Free transform** (scale/rotate/skew of layer or selection) | Only flip/rotate-90 exists today. | M | Affine warp of the layer's pixels + a handle gizmo. |
 
@@ -39,9 +44,9 @@ Right now SWEET can't exchange 3D with any other tool, and the viewport is flat-
 
 | # | Item | Why it matters | Effort | Notes |
 |---|---|---|---|---|
-| G1 | **glTF + OBJ import/export** | Lets SWEET participate in a real pipeline; huge leverage. | M | `gltf` + `obj`/`tobj` crates (MIT). Map to the existing `Mesh`/half-edge model. |
-| G2 | **Basic PBR material** (base color / metallic / roughness + one light) | The viewport looks flat without shading; needed before any render. | M | Principled-ish BRDF in the existing wgpu pipeline; per-object material on `Document`. |
-| G3 | **UV unwrap** | Prerequisite for real texture painting/materials. | L | `xatlas`-style atlas; check `xatlas-rs` license before vendoring, else clean-room angle-based unwrap. |
+| G1 | **glTF + OBJ import/export** | Lets SWEET participate in a real pipeline; huge leverage. | L | Hand-write the glTF JSON+binary reader/writer and the OBJ text parser ourselves (spec-compliance work, mechanical but real); map directly into the existing `Mesh`/half-edge model — no vendored 3D-format crate. |
+| G2 | **Basic PBR material** (base color / metallic / roughness + one light) | The viewport looks flat without shading; needed before any render. | M | Principled-ish BRDF derived from the published Disney/Karis papers, written into the existing wgpu pipeline ourselves; per-object material on `Document`. |
+| G3 | **UV unwrap** | Prerequisite for real texture painting/materials. | L | Clean-room angle-based/LSCM-style unwrap, built from published algorithm descriptions — no vendored atlas library. |
 
 ## Tier 3 — amplify the differentiator (the unified canvas)
 
