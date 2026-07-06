@@ -1,0 +1,74 @@
+# SWEET roadmap — prioritized by the gaps in COMPARISON.md
+
+_Ordering principle: close the gaps whose **absence makes SWEET feel broken** first, then
+interop, then depth, then amplify the one thing neither Photoshop nor Blender does (the
+unified 2D+3D canvas). Effort is a rough T-shirt size._
+
+_License rule (hard): only MIT/Apache/BSD/Zlib crates may be vendored. GPL/AGPL code
+(Blender, Krita, A3D, GIMP) is **reference-only, clean-room**. Candidate crates below are
+pre-checked for permissive licenses._
+
+_Last updated: 2026-06-29._
+
+---
+
+## Tier 0 — the "believable raster editor" floor (do now)
+
+These are table-stakes; their absence is the first thing a Photoshop user notices.
+
+| # | Item | Why it matters | Effort | Notes |
+|---|---|---|---|---|
+| M5 | **Arbitrary canvas size** | Fixed square surface is the single most glaring limit — real images aren't 256². | M | Wire the existing 256² `TileCanvas` sparse substrate as the main surface; decouple width≠height. |
+| M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | M–L | `cosmic-text` + `glyphon` (both MIT/Apache) for shaping/atlas. Start: single-line, font/size/color, rasterize to active layer. |
+| M4b | **Crop** | Trivially expected; pairs with M5. | S | Crop = resize canvas + offset layers. |
+| M4c | **Free transform** (scale/rotate/skew of layer or selection) | Only flip/rotate-90 exists today. | M | Affine warp of the layer's pixels + a handle gizmo. |
+
+## Tier 1 — selections & non-destructive editing (do next)
+
+The current rectangle-only selection + no masks is the biggest _depth_ gap on the 2D side.
+
+| # | Item | Why it matters | Effort | Notes |
+|---|---|---|---|---|
+| S1 | **Selection mask texture** | Unlocks everything below; replaces the single scissor-rect. | M | Per-pixel alpha mask instead of a rect; paint/gradient/adjustments sample it. |
+| S2 | **Lasso + polygon + wand-as-selection + feather** | Real selection toolkit. | M | Builds directly on S1 (wand already exists as a fill; retarget to write the mask; feather = blur the mask). |
+| S3 | **Layer masks** | The core of non-destructive editing. | M | Reuse the S1 mask machinery per layer. |
+
+## Tier 2 — 3D interop & material credibility
+
+Right now SWEET can't exchange 3D with any other tool, and the viewport is flat-shaded.
+
+| # | Item | Why it matters | Effort | Notes |
+|---|---|---|---|---|
+| G1 | **glTF + OBJ import/export** | Lets SWEET participate in a real pipeline; huge leverage. | M | `gltf` + `obj`/`tobj` crates (MIT). Map to the existing `Mesh`/half-edge model. |
+| G2 | **Basic PBR material** (base color / metallic / roughness + one light) | The viewport looks flat without shading; needed before any render. | M | Principled-ish BRDF in the existing wgpu pipeline; per-object material on `Document`. |
+| G3 | **UV unwrap** | Prerequisite for real texture painting/materials. | L | `xatlas`-style atlas; check `xatlas-rs` license before vendoring, else clean-room angle-based unwrap. |
+
+## Tier 3 — amplify the differentiator (the unified canvas)
+
+This is where SWEET does what the incumbents can't. Lean in once the floor is solid.
+
+| # | Item | Why it matters | Effort | Notes |
+|---|---|---|---|---|
+| U1 | **Depth + color/normal pass export** | Foundation for compositing 3D into 2D and for AI-render (clean-room, L4-safe; the A3D-inspired direction). | M | Render depth buffer + flat color/normal passes to PNG. No external services. |
+| U2 | **Render 3D viewport → raster layer** | Bake the scene into a paint layer; true 2D↔3D round-trip in one doc. | S–M | Copy the composited viewport into a new `PaintLayer`. |
+| U3 | **AI-render bridge (local ComfyUI only)** | Send U1 passes as ControlNet input, get a render back. | L | **Gated:** local/offline only by default; cloud APIs (Fal.ai etc.) need explicit sign-off — spend + secrets (L4). |
+
+## Deliberately out of scope (for now)
+
+Depth that would be years of work and isn't on the critical path to the thesis:
+physics/simulation, geometry/compositor node graphs, Cycles-class path tracer, CMYK/print
++ ICC color management, PSD read/write, FBX/USD, NLA/graph-editor animation depth,
+multires/dyntopo sculpting. Revisit only if a concrete user need pulls them in.
+
+## Sequencing summary
+
+```
+Tier 0  (floor)      → M5 canvas · text · crop · free-transform
+Tier 1  (selections) → mask texture → lasso/poly/wand/feather → layer masks
+Tier 2  (3D interop) → glTF/OBJ I/O → PBR material → UV unwrap
+Tier 3  (unified)    → depth/color passes → render-to-layer → local AI bridge
+```
+
+Rationale: Tiers 0–1 make SWEET a _credible_ 2D editor; Tier 2 makes it a _connectable_
+3D tool; Tier 3 is the moat. Ship Tier 0 before anything glamorous — a text tool and
+arbitrary canvas size buy more credibility than a path tracer.
