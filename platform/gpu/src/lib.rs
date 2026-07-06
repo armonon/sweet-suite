@@ -333,6 +333,24 @@ pub fn rotate_canvas_pixels(src: &[u8], width: usize, height: usize, cw: bool) -
     dst
 }
 
+/// **Pure** crop of an RGBA8 buffer to the `(x0, y0, crop_w, crop_h)` sub-rectangle (texel
+/// space, top-left origin). `x0+crop_w` and `y0+crop_h` are clamped to the source bounds —
+/// used for `Renderer::crop_to_rect` (M4).
+pub fn crop_pixels(src: &[u8], src_width: usize, src_height: usize, x0: usize, y0: usize, crop_w: usize, crop_h: usize) -> Vec<u8> {
+    let x0 = x0.min(src_width);
+    let y0 = y0.min(src_height);
+    let crop_w = crop_w.min(src_width - x0).max(1);
+    let crop_h = crop_h.min(src_height - y0).max(1);
+    let mut dst = vec![0u8; crop_w * crop_h * 4];
+    for y in 0..crop_h {
+        let src_row_start = ((y0 + y) * src_width + x0) * 4;
+        let dst_row_start = y * crop_w * 4;
+        dst[dst_row_start..dst_row_start + crop_w * 4]
+            .copy_from_slice(&src[src_row_start..src_row_start + crop_w * 4]);
+    }
+    dst
+}
+
 /// Drives the translate-gizmo draw. The renderer reads this once per frame; nothing is
 /// retained across frames.
 #[derive(Clone, Copy, Debug)]
@@ -1781,6 +1799,58 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
+    /// **M4: Crop.** Crop the whole document to the UV-space rect `[x0, y0, x1, y1]` (every
+    /// layer + the comp/display buffers together, so they stay aligned — same reasoning as
+    /// `rotate_canvas_90`). Not undoable (a structural resize). No-op if the rect is
+    /// degenerate (zero area).
+    pub fn crop_to_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let (old_w, old_h) = (self.raster.width() as usize, self.raster.height() as usize);
+        let px0 = ((x0 * old_w as f32).floor() as usize).min(old_w.saturating_sub(1));
+        let py0 = ((y0 * old_h as f32).floor() as usize).min(old_h.saturating_sub(1));
+        let crop_w = (((x1 * old_w as f32).ceil() as usize).saturating_sub(px0)).max(1);
+        let crop_h = (((y1 * old_h as f32).ceil() as usize).saturating_sub(py0)).max(1);
+        let (new_w, new_h) = (crop_w as u32, crop_h as u32);
+
+        // Drain layers 0-first (see `rotate_canvas_90` for why: reading `layer_pixels(i)`
+        // against the shrinking vec would desync pixels from the wrong layer's metadata).
+        let n = self.layers.len();
+        let mut cropped_layers: Vec<(Vec<u8>, PaintLayer)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let src = self.layer_pixels(0);
+            let cropped = crop_pixels(&src, old_w, old_h, px0, py0, crop_w, crop_h);
+            cropped_layers.push((cropped, self.layers.remove(0)));
+        }
+
+        self.raster = RasterCanvas::new(&self.device, new_w, new_h, [0.97, 0.96, 0.94, 1.0]);
+        let (comp_a, comp_a_view) = Self::make_scratch_texture(&self.device, new_w, new_h, "layer comp a");
+        let (comp_b, comp_b_view) = Self::make_scratch_texture(&self.device, new_w, new_h, "layer comp b");
+        self.comp_a = comp_a;
+        self.comp_a_view = comp_a_view;
+        self.comp_b = comp_b;
+        self.comp_b_view = comp_b_view;
+        self.paint_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint bind group"),
+            layout: &self.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(self.raster.texture_view()) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+            ],
+        });
+
+        self.layers = cropped_layers
+            .into_iter()
+            .map(|(pixels, old)| {
+                let mut canvas = RasterCanvas::new(&self.device, new_w, new_h, [0.0, 0.0, 0.0, 0.0]);
+                canvas.upload_rgba(&self.queue, &pixels);
+                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend }
+            })
+            .collect();
+        self.layers_dirty = true;
+    }
+
     /// **Magic wand**: flood-fill from `seed_uv` on the paint canvas, selecting pixels
     /// within `tolerance` (0–1 per channel) of the seed color. Fills the selection with
     /// `fill_color` (RGBA linear, pre-multiplied alpha) and re-uploads the result.
@@ -2885,7 +2955,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, rotate_canvas_pixels, LayerTransform};
+    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, rotate_canvas_pixels, LayerTransform};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -2957,6 +3027,31 @@ mod m4_tests {
         // CW into a (h×w) buffer: (0,0) -> (h-1, 0).
         let out_w = h;
         assert_eq!(px(&out, out_w, h - 1, 0), px(&src, w, 0, 0));
+    }
+
+    /// M4: crop extracts exactly the requested sub-rect, at the right output dimensions,
+    /// with pixels coming from the right source location (not shifted/misaligned).
+    #[test]
+    fn crop_extracts_the_requested_sub_rect() {
+        let (w, h) = (10, 6);
+        let src = ramp(w, h);
+        // Crop [x0=2, y0=1, w=4, h=3] out of the 10×6 source.
+        let out = crop_pixels(&src, w, h, 2, 1, 4, 3);
+        assert_eq!(out.len(), 4 * 3 * 4, "output is crop_w*crop_h*4 bytes");
+        // Output (0,0) should be source (2,1); output (3,2) should be source (5,3).
+        assert_eq!(px(&out, 4, 0, 0), px(&src, w, 2, 1));
+        assert_eq!(px(&out, 4, 3, 2), px(&src, w, 5, 3));
+    }
+
+    #[test]
+    fn crop_clamps_a_rect_that_overruns_the_source_bounds() {
+        let (w, h) = (8, 8);
+        let src = ramp(w, h);
+        // Ask for a crop that runs 4 texels past the right/bottom edges.
+        let out = crop_pixels(&src, w, h, 6, 6, 6, 6);
+        // Clamped to the 2×2 that actually exists from (6,6) to (8,8).
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!(px(&out, 2, 0, 0), px(&src, w, 6, 6));
     }
 
     #[test]

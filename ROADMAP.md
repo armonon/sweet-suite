@@ -26,7 +26,7 @@ These are table-stakes; their absence is the first thing a Photoshop user notice
 | M5 | ~~**Arbitrary canvas size**~~ **DONE (core) 2026-07-06** | Fixed square surface is the single most glaring limit — real images aren't square. | M | Shipped: `RasterCanvas` width/height decoupled everywhere; "Import Image" sizes the whole canvas to the image's native aspect (no more white-padding); 90° rotate became a whole-document op; PaintCanvas 3D quad rescales to match. **Still open:** wiring the sparse `TileCanvas` (256² tiles, up to 4096² extent) as the main surface for truly huge/gigapixel canvases — a distinct, larger feature, tracked as M5b below. See DECISIONS.md 2026-07-06. |
 | M5b | **Sparse/huge canvas via `TileCanvas`** | Split out of M5 — genuinely separate scope (sparse allocation, cross-tile brush stamping, compositor changes) from "not forced square". | L | `platform/gpu/src/tile_canvas.rs` already exists and is tested in isolation; wire it in as the main per-layer surface once there's a concrete need for canvases beyond ~4K². |
 | M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | L | Font-file **byte parsing** (pure format decode) is fine to depend on; hand-build the layout/kerning/rasterization on top ourselves. Start: single-line Latin, font/size/color, rasterize to active layer — defer full Unicode shaping/bidi/complex scripts. |
-| M4b | **Crop** | Trivially expected; now that canvas dims are decoupled, this is just resize canvas + offset layers — no longer blocked. | S | Crop = resize canvas + offset layers (the `import_replace_canvas`-style recreate path already does most of this mechanically). |
+| M4b | ~~**Crop**~~ **DONE 2026-07-06** | Trivially expected; unblocked by M5's canvas-resize machinery. | S | Shipped: `Renderer::crop_to_rect` reuses M3's rect selection as the crop source + M5's drain-and-recreate pattern. "Crop to Selection" in the RectSelect inspector. See DECISIONS.md. |
 | M4c | **Free transform** (scale/rotate/skew of layer or selection) | Only flip/rotate-90 exists today. | M | Affine warp of the layer's pixels + a handle gizmo. |
 
 ## Tier 1 — selections & non-destructive editing (do next)
@@ -69,7 +69,7 @@ multires/dyntopo sculpting. Revisit only if a concrete user need pulls them in.
 ## Sequencing summary
 
 ```
-Tier 0  (floor)      → M5 canvas (done) · text · crop · free-transform · M5b sparse canvas
+Tier 0  (floor)      → M5 canvas (done) · crop (done) · text · free-transform · M5b sparse canvas
 Tier 1  (selections) → mask texture → lasso/poly/wand/feather → layer masks
 Tier 2  (3D interop) → glTF/OBJ I/O → PBR material → UV unwrap
 Tier 3  (unified)    → depth/color passes → render-to-layer → local AI bridge

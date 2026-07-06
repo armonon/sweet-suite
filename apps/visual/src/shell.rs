@@ -108,6 +108,9 @@ pub struct ShellState {
     /// WHOLE document (every layer + the canvas dimensions swap) — a 90° rotation can't be
     /// done per-layer once the canvas may be non-square (M5).
     pub pending_canvas_rotate: Option<suite_gpu::CanvasRotate>,
+    /// Set by the "Crop to Selection" button; drained in main.rs. UV-space rect
+    /// `[x0, y0, x1, y1]` to crop the whole document (every layer) down to (M4).
+    pub pending_crop: Option<[f32; 4]>,
 }
 
 impl Default for ShellState {
@@ -151,6 +154,7 @@ impl Default for ShellState {
             gradient_preview: None,
             pending_layer_transform: None,
             pending_canvas_rotate: None,
+            pending_crop: None,
         }
     }
 }
@@ -708,7 +712,17 @@ pub fn draw_shell(
                         _ => None, // partial selection → deselect (full invert needs polygon)
                     };
                 }
+                ui.add_space(8.0);
+                // M4: crop the whole document down to the selection rect. Disabled with no
+                // selection, or with the whole-canvas selection (nothing to crop to).
+                let can_crop = matches!(state.selection_rect, Some([x0, y0, x1, y1])
+                    if (x1 - x0) < 0.999 || (y1 - y0) < 0.999);
+                if ui.add_enabled(can_crop, egui::Button::new(RichText::new("Crop to Selection").color(TEXT_0))).clicked() {
+                    state.pending_crop = state.selection_rect;
+                }
                 ui.add_space(4.0);
+                ui.label(RichText::new("Crops every layer + the canvas to the selection. Not undoable.").color(TEXT_2).small());
+                ui.add_space(8.0);
                 ui.label(RichText::new("Switch to Paint (B) to paint inside the selection.").color(TEXT_2).small());
                 ui.add_space(12.0);
             }

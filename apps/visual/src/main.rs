@@ -955,6 +955,22 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
 
+                // Apply a "Crop to Selection" (M4) issued by the RectSelect inspector. Not
+                // undoable — a structural resize, same posture as rotate/import. The old
+                // selection rect no longer means anything at the new dims, so clear it.
+                if let Some([x0, y0, x1, y1]) = self.shell.pending_crop.take() {
+                    renderer.crop_to_rect(x0, y0, x1, y1);
+                    let (w, h) = (renderer.canvas_width(), renderer.canvas_height());
+                    Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
+                    self.undo_order.clear();
+                    self.redo_order.clear();
+                    self.shell.selection_rect = None;
+                    self.input.select_rect = None;
+                    renderer.selection_rect = None;
+                    self.shell.dirty = true;
+                    window.request_redraw();
+                }
+
                 // Inspector undo: an edit this frame opens/extends a burst; a frame with no
                 // edit closes it, recording one coalesced transaction.
                 if self.shell.edited_object {

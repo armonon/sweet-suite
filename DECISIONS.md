@@ -1313,3 +1313,22 @@ Armon: "yes do all [ROADMAP tiers], really reference it [the real algorithms/pri
 Live GUI verification was blocked this session: both the computer-use screenshot tool and the native macOS `screencapture` CLI returned solid-black frames, and an `osascript`/TCC permission query hung outright — a system-level Screen Recording/Automation permission failure, not a code issue, and not something fixable from inside the sandbox. Packaged the app, loaded a hand-crafted 800×300 test PNG (`suite-visual wide_test.png`) via command-line launch to confirm the process runs without crashing, but could not visually confirm the aspect ratio renders correctly on screen. Substituted the automated test suite above as verification. **A real visual check (import a wide/tall image, confirm no squish; rotate canvas; flip/180°; save→reopen) is still owed** once the permission issue is resolved — flagging this rather than claiming a live check that didn't happen.
 
 Next: remaining M4 (crop, text tool), then Tier 1 (selection mask + lasso/poly/wand/feather).
+
+---
+
+## GIMP ladder — M4: Crop — 2026-07-06
+
+Directly unblocked by M5: crop is exactly "resize the canvas + offset layers", and M5 had just built that exact recreate-at-new-dims machinery for `import_replace_canvas`/`rotate_canvas_90`.
+
+### What shipped
+- **`crop_pixels(src, src_width, src_height, x0, y0, crop_w, crop_h)`** (pure fn, `platform/gpu/src/lib.rs`): extracts a sub-rectangle from an RGBA8 buffer, row by row. Clamps `crop_w`/`crop_h` if the requested rect overruns the source.
+- **`Renderer::crop_to_rect(x0, y0, x1, y1)`** (UV space, 0..1): drains every layer (same 0-first drain pattern as `rotate_canvas_90`, for the same reason — reading `layer_pixels(i)` against a shrinking vec would desync pixels from the wrong layer once removal starts), crops each layer's pixels to the rect, then recreates `raster`/`comp_a`/`comp_b`/the whole layer stack at the cropped dimensions, uploading each layer's cropped pixels. No-op on a degenerate (zero-area) rect.
+- **UI**: "Crop to Selection" button in the `RectSelect` inspector panel — reuses the M3 selection rect directly as the crop source. Disabled when there's no selection or the selection is the whole canvas (nothing to crop to). Wired through `ShellState::pending_crop` → `main.rs` drains it, calls `crop_to_rect`, rescales the `PaintCanvas` 3D object to the new aspect (via the same `rescale_paint_canvases_to_aspect` helper M5 built), clears the now-meaningless old selection, and clears the undo/redo queues (crop is a structural resize, not undoable — same posture as import/rotate).
+
+### Testing
+2 new tests: `crop_extracts_the_requested_sub_rect` (verifies output dims + that pixels come from the right source offset, not shifted), `crop_clamps_a_rect_that_overruns_the_source_bounds`. 76 workspace tests green.
+
+### Verification gap continues
+Same system-level Screen Recording/Automation permission issue as M5 — briefly cleared mid-session (one real screenshot went through) then reverted to black frames once another Claude session took the computer-use lock, confirmed by the returned image being byte-identical in size to the earlier failure. Relied on the automated suite again rather than claim an interactive check (drag a selection, click Crop, confirm the canvas actually shrinks) that didn't happen. Owed once the lock/permission situation is clear.
+
+Next: remaining M4 (text tool, free transform), then Tier 1 (selection mask + lasso/poly/wand/feather).
