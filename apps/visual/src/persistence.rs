@@ -16,16 +16,19 @@ const MAIN_SCENE_ROLE: &str = "main.visual.scene";
 const PAINT_BLOB: &str = "main.paint.png";
 const LAYERS_META_ROLE: &str = "main.layers";
 
-/// A painted raster ready to embed: square `size`, row-major RGBA8 `rgba`.
+/// A painted raster ready to embed: `width`×`height` (M5: no longer forced square),
+/// row-major RGBA8 `rgba`.
 pub struct PaintImage {
-    pub size: u32,
+    pub width: u32,
+    pub height: u32,
     pub rgba: Vec<u8>,
 }
 
 /// One layer's pixels + metadata for the `.sweet` layer stack.
 pub struct LayerSave {
     pub rgba: Vec<u8>,
-    pub size: u32,
+    pub width: u32,
+    pub height: u32,
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
@@ -51,7 +54,7 @@ pub fn save_to(doc: &Document, layers: &[LayerSave], path: &Path) -> Result<Stri
             .collect();
         bundle.put_document(LAYERS_META_ROLE, serde_json::Value::Array(meta));
         for (i, l) in layers.iter().enumerate() {
-            let png = encode_png(&PaintImage { size: l.size, rgba: l.rgba.clone() })
+            let png = encode_png(&PaintImage { width: l.width, height: l.height, rgba: l.rgba.clone() })
                 .map_err(|e| format!("layer {i} encode failed: {e}"))?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
             bundle.put_blob(format!("main.layer.{i}.png"), b64);
@@ -123,7 +126,7 @@ fn decode_layer_blob(
         .decode(b64)
         .map_err(|e| format!("{blob_name} base64 decode failed: {e}"))?;
     let img = decode_png(&png).map_err(|e| format!("{blob_name} decode failed: {e}"))?;
-    Ok(Some(LayerSave { rgba: img.rgba, size: img.size, name, visible, opacity, blend }))
+    Ok(Some(LayerSave { rgba: img.rgba, width: img.width, height: img.height, name, visible, opacity, blend }))
 }
 
 /// Load a `.sweet` bundle from `path`. Fail-closed on a foreign file, a future
@@ -168,62 +171,56 @@ pub fn load_from(path: &Path) -> Result<Loaded, String> {
     Ok(Loaded { document, layers })
 }
 
-/// Native "Import Image" dialog → decode any common raster format → fit it (aspect-
-/// preserving, white-padded) into a `canvas_size`² RGBA8 buffer ready for the paint canvas.
-/// Returns the pixels + a status string. `None` if the user cancelled.
-pub fn import_image_dialog(canvas_size: u32) -> Option<(Vec<u8>, String)> {
+/// Native "Import Image" dialog → decode any common raster format → downscale (aspect-
+/// preserving) only if it exceeds `max_dim` per axis. Returns `(width, height, rgba)` + a
+/// status string. `None` if the user cancelled.
+///
+/// M5: the canvas takes the image's own aspect ratio — no more forcing it into a square
+/// with white padding. `max_dim` just bounds VRAM for an oversized source image.
+pub fn import_image_dialog(max_dim: u32) -> Option<((u32, u32), Vec<u8>, String)> {
     let path = rfd::FileDialog::new()
         .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga", "gif", "webp"])
         .pick_file()?;
-    match import_image_from(&path, canvas_size) {
-        Ok(rgba) => Some((rgba, format!("Imported {}", path.display()))),
-        Err(e) => Some((Vec::new(), format!("Import failed: {e}"))),
+    match import_image_from(&path, max_dim) {
+        Ok((w, h, rgba)) => Some(((w, h), rgba, format!("Imported {}", path.display()))),
+        Err(e) => Some(((0, 0), Vec::new(), format!("Import failed: {e}"))),
     }
 }
 
-/// Decode `path` and fit it into a `size`² white canvas, aspect-preserved + centered.
-pub fn import_image_from(path: &Path, size: u32) -> Result<Vec<u8>, String> {
+/// Decode `path`, downscaling (Lanczos3, aspect-preserved) only if it's larger than
+/// `max_dim` on either axis. Returns the resulting `(width, height, rgba)` — the canvas the
+/// caller creates should be exactly this size (M5: no padding into a forced square).
+pub fn import_image_from(path: &Path, max_dim: u32) -> Result<(u32, u32, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
     let src = img.to_rgba8();
     let (sw, sh) = (src.width().max(1), src.height().max(1));
 
-    // Scale to fit *within* the square (contain), preserving aspect.
-    let scale = (size as f32 / sw as f32).min(size as f32 / sh as f32);
-    let dw = ((sw as f32 * scale).round() as u32).clamp(1, size);
-    let dh = ((sh as f32 * scale).round() as u32).clamp(1, size);
-    let resized = image::imageops::resize(&src, dw, dh, image::imageops::FilterType::Lanczos3);
-
-    // White, opaque background; blit the resized image centered.
-    let mut canvas = vec![255u8; (size * size * 4) as usize];
-    let ox = (size - dw) / 2;
-    let oy = (size - dh) / 2;
-    for y in 0..dh {
-        for x in 0..dw {
-            let p = resized.get_pixel(x, y).0; // [r,g,b,a]
-            let cx = ox + x;
-            let cy = oy + y;
-            let di = ((cy * size + cx) * 4) as usize;
-            // Source-over the (possibly transparent) pixel onto white.
-            let a = p[3] as f32 / 255.0;
-            for c in 0..3 {
-                let over = p[c] as f32 * a + 255.0 * (1.0 - a);
-                canvas[di + c] = over.round().clamp(0.0, 255.0) as u8;
-            }
-            canvas[di + 3] = 255;
-        }
-    }
-    Ok(canvas)
+    let scale = (max_dim as f32 / sw as f32).min(max_dim as f32 / sh as f32).min(1.0);
+    let (dw, dh) = if scale < 1.0 {
+        (
+            ((sw as f32 * scale).round() as u32).max(1),
+            ((sh as f32 * scale).round() as u32).max(1),
+        )
+    } else {
+        (sw, sh)
+    };
+    let rgba = if (dw, dh) == (sw, sh) {
+        src.into_raw()
+    } else {
+        image::imageops::resize(&src, dw, dh, image::imageops::FilterType::Lanczos3).into_raw()
+    };
+    Ok((dw, dh, rgba))
 }
 
-/// Native "Export PNG" dialog → write `rgba` (`size`² RGBA8) as a PNG. Returns a status.
-pub fn export_png_dialog(rgba: &[u8], size: u32) -> Option<String> {
+/// Native "Export PNG" dialog → write `rgba` (`width`×`height` RGBA8) as a PNG. Returns a status.
+pub fn export_png_dialog(rgba: &[u8], width: u32, height: u32) -> Option<String> {
     let path = rfd::FileDialog::new()
         .add_filter("PNG image", &["png"])
         .set_file_name("export.png")
         .save_file()?;
     let path = if path.extension().is_some() { path } else { path.with_extension("png") };
-    let img = PaintImage { size, rgba: rgba.to_vec() };
+    let img = PaintImage { width, height, rgba: rgba.to_vec() };
     match encode_png(&img).and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string())) {
         Ok(()) => Some(format!("Exported {}", path.display())),
         Err(e) => Some(format!("Export failed: {e}")),
@@ -233,7 +230,7 @@ pub fn export_png_dialog(rgba: &[u8], size: u32) -> Option<String> {
 fn encode_png(img: &PaintImage) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut out, img.size, img.size);
+        let mut encoder = png::Encoder::new(&mut out, img.width, img.height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
@@ -244,6 +241,7 @@ fn encode_png(img: &PaintImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Decode a PNG into RGBA8 at its own native dimensions (M5: any aspect ratio, not just square).
 fn decode_png(bytes: &[u8]) -> Result<PaintImage, String> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
@@ -252,12 +250,6 @@ fn decode_png(bytes: &[u8]) -> Result<PaintImage, String> {
         .ok_or_else(|| "png output buffer size unavailable".to_string())?;
     let mut buf = vec![0u8; out_size];
     let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    if info.width != info.height {
-        return Err(format!(
-            "paint image must be square, got {}x{}",
-            info.width, info.height
-        ));
-    }
     // Normalize to RGBA8 if the PNG came in as RGB.
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
@@ -271,7 +263,8 @@ fn decode_png(bytes: &[u8]) -> Result<PaintImage, String> {
         other => return Err(format!("unsupported paint color type {other:?}")),
     };
     Ok(PaintImage {
-        size: info.width,
+        width: info.width,
+        height: info.height,
         rgba,
     })
 }
@@ -304,8 +297,8 @@ mod tests {
             v
         };
         let layers = vec![
-            LayerSave { rgba: make([10, 20, 30, 255]), size, name: "Background".into(), visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal },
-            LayerSave { rgba: make([200, 100, 50, 128]), size, name: "Layer 2".into(), visible: false, opacity: 0.5, blend: suite_doc::BlendMode::Multiply },
+            LayerSave { rgba: make([10, 20, 30, 255]), width: size, height: size, name: "Background".into(), visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal },
+            LayerSave { rgba: make([200, 100, 50, 128]), width: size, height: size, name: "Layer 2".into(), visible: false, opacity: 0.5, blend: suite_doc::BlendMode::Multiply },
         ];
 
         let path = std::env::temp_dir().join("sweet-visual-layers-roundtrip.sweet");
@@ -336,7 +329,7 @@ mod tests {
         let size = 4u32;
         let mut rgba = vec![255u8; (size * size * 4) as usize];
         rgba[0..4].copy_from_slice(&[7, 8, 9, 255]);
-        let png = encode_png(&PaintImage { size, rgba }).unwrap();
+        let png = encode_png(&PaintImage { width: size, height: size, rgba }).unwrap();
         bundle.put_blob(PAINT_BLOB, base64::engine::general_purpose::STANDARD.encode(&png));
         let path = std::env::temp_dir().join("sweet-visual-legacy.sweet");
         bundle.save(&path).unwrap();
@@ -356,30 +349,42 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// M5: importing a non-square image under `max_dim` keeps its own native aspect ratio —
+    /// no forced-square padding, unlike the pre-M5 behaviour.
     #[test]
-    fn import_image_fits_centered_on_white() {
-        // A 4×2 solid-red image imported into a 16² canvas: scale = min(16/4,16/2)=4 →
-        // 16×8, so it fills width and is letterboxed top/bottom with white.
+    fn import_image_keeps_native_aspect_when_under_max_dim() {
         let mut img = image::RgbaImage::new(4, 2);
         for p in img.pixels_mut() {
             *p = image::Rgba([200, 30, 30, 255]);
         }
         let dir = std::env::temp_dir();
-        let path = dir.join("sweet_import_test.png");
+        let path = dir.join("sweet_import_test_aspect.png");
         img.save(&path).unwrap();
 
-        let size = 16u32;
-        let out = import_image_from(&path, size).unwrap();
-        assert_eq!(out.len(), (size * size * 4) as usize);
+        let (w, h, rgba) = import_image_from(&path, 16).unwrap();
+        assert_eq!((w, h), (4, 2), "canvas takes the image's own dimensions, not a forced square");
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
+        // Every pixel is the solid red source colour — no padding anywhere.
+        for px in rgba.chunks_exact(4) {
+            assert!(px[0] > 150 && px[1] < 90 && px[2] < 90, "no padding pixels, got {px:?}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 
-        let at = |x: u32, y: u32| {
-            let i = ((y * size + x) * 4) as usize;
-            [out[i], out[i + 1], out[i + 2], out[i + 3]]
-        };
-        // Center is the red image; top-row is white padding.
-        let c = at(8, 8);
-        assert!(c[0] > 150 && c[1] < 90 && c[2] < 90, "center should be red, got {c:?}");
-        assert_eq!(at(8, 0), [255, 255, 255, 255], "top row is white padding");
+    /// An oversized image is downscaled to fit `max_dim`, preserving aspect ratio.
+    #[test]
+    fn import_image_downscales_when_over_max_dim() {
+        let mut img = image::RgbaImage::new(40, 20); // 2:1 aspect
+        for p in img.pixels_mut() {
+            *p = image::Rgba([30, 200, 30, 255]);
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("sweet_import_test_downscale.png");
+        img.save(&path).unwrap();
+
+        let (w, h, rgba) = import_image_from(&path, 10).unwrap();
+        assert_eq!((w, h), (10, 5), "downscaled to fit max_dim=10, aspect preserved (2:1)");
+        assert_eq!(rgba.len(), (w * h * 4) as usize);
         let _ = std::fs::remove_file(&path);
     }
 }

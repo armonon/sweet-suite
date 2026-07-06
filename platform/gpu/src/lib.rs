@@ -187,14 +187,22 @@ impl GizmoAxis {
 }
 
 /// Whole-layer pixel transforms (M4). Applied as a single undoable edit on the active
-/// layer's canvas. The paint canvas is square, so 90° rotations preserve dimensions.
+/// layer's canvas. Deliberately dimension-preserving (safe on any aspect ratio, M5) — a
+/// 90° rotation is a **document**-level operation instead (`CanvasRotate` + `rotate_canvas_90`)
+/// since it must rotate every layer + the comp buffers together to keep them aligned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerTransform {
     FlipH,
     FlipV,
-    Rotate90Cw,
-    Rotate90Ccw,
     Rotate180,
+}
+
+/// Whole-**document** 90° rotation (M5): swaps width↔height, rotating every layer plus the
+/// comp/display buffers together so they stay aligned. See `Renderer::rotate_canvas_90`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanvasRotate {
+    Cw,
+    Ccw,
 }
 
 // sRGB <-> linear transfer (the paint texture is `Rgba8UnormSrgb`, so direct CPU pixel
@@ -216,7 +224,8 @@ fn linear_to_srgb(c: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn apply_gradient_fill(
     pixels: &mut [u8],
-    size: usize,
+    width: usize,
+    height: usize,
     from_uv: [f32; 2],
     to_uv: [f32; 2],
     color_a: [f32; 4],
@@ -226,18 +235,22 @@ pub fn apply_gradient_fill(
 ) {
     let (sx0, sy0, sx1, sy1) = match selection {
         Some([x0, y0, x1, y1]) if x1 > x0 && y1 > y0 => (
-            (x0 * size as f32).floor().max(0.0) as usize,
-            (y0 * size as f32).floor().max(0.0) as usize,
-            (x1 * size as f32).ceil().min(size as f32) as usize,
-            (y1 * size as f32).ceil().min(size as f32) as usize,
+            (x0 * width as f32).floor().max(0.0) as usize,
+            (y0 * height as f32).floor().max(0.0) as usize,
+            (x1 * width as f32).ceil().min(width as f32) as usize,
+            (y1 * height as f32).ceil().min(height as f32) as usize,
         ),
-        _ => (0, 0, size, size),
+        _ => (0, 0, width, height),
     };
 
-    let fx = from_uv[0] * size as f32;
-    let fy = from_uv[1] * size as f32;
-    let dx = (to_uv[0] - from_uv[0]) * size as f32;
-    let dy = (to_uv[1] - from_uv[1]) * size as f32;
+    // Gradient direction/radius in texel space. Using `width` for both axes here (not a
+    // separate per-axis scale) means the from/to UVs already encode the visual direction
+    // the user dragged on screen — the gradient itself has no "shape" to correct for aspect
+    // (unlike a round brush dab), so no aspect correction is needed here.
+    let fx = from_uv[0] * width as f32;
+    let fy = from_uv[1] * height as f32;
+    let dx = (to_uv[0] - from_uv[0]) * width as f32;
+    let dy = (to_uv[1] - from_uv[1]) * height as f32;
     let len2 = (dx * dx + dy * dy).max(1e-6);
     let radius = len2.sqrt().max(1e-6);
 
@@ -257,7 +270,7 @@ pub fn apply_gradient_fill(
             if sa <= 0.0 {
                 continue;
             }
-            let idx = (y * size + x) * 4;
+            let idx = (y * width + x) * 4;
             let dr = srgb_to_linear(pixels[idx] as f32 / 255.0);
             let dg = srgb_to_linear(pixels[idx + 1] as f32 / 255.0);
             let db = srgb_to_linear(pixels[idx + 2] as f32 / 255.0);
@@ -280,21 +293,40 @@ pub fn apply_gradient_fill(
     }
 }
 
-/// **Pure** whole-canvas flip/rotate of a square RGBA8 buffer. Returns the transformed
-/// buffer (same length). `size` is the side length in texels.
-pub fn apply_layer_transform(src: &[u8], size: usize, op: LayerTransform) -> Vec<u8> {
+/// **Pure** whole-layer flip/180°-rotate of an RGBA8 buffer. Returns a same-size,
+/// same-dimensions buffer — these three ops never change width/height, so they're always
+/// safe on a non-square (M5) canvas. (90° rotation swaps width↔height for the WHOLE
+/// document, not one layer — see `rotate_canvas_pixels` — so it isn't a `LayerTransform`.)
+pub fn apply_layer_transform(src: &[u8], width: usize, height: usize, op: LayerTransform) -> Vec<u8> {
     let mut dst = vec![0u8; src.len()];
-    for y in 0..size {
-        for x in 0..size {
+    for y in 0..height {
+        for x in 0..width {
             let (nx, ny) = match op {
-                LayerTransform::FlipH => (size - 1 - x, y),
-                LayerTransform::FlipV => (x, size - 1 - y),
-                LayerTransform::Rotate90Cw => (size - 1 - y, x),
-                LayerTransform::Rotate90Ccw => (y, size - 1 - x),
-                LayerTransform::Rotate180 => (size - 1 - x, size - 1 - y),
+                LayerTransform::FlipH => (width - 1 - x, y),
+                LayerTransform::FlipV => (x, height - 1 - y),
+                LayerTransform::Rotate180 => (width - 1 - x, height - 1 - y),
             };
-            let si = (y * size + x) * 4;
-            let di = (ny * size + nx) * 4;
+            let si = (y * width + x) * 4;
+            let di = (ny * width + nx) * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    dst
+}
+
+/// **Pure** 90° rotation of an RGBA8 buffer, swapping width↔height in the output — used for
+/// a whole-canvas rotate (every layer + the doc's overall dimensions rotate together, so
+/// they all stay aligned). `cw=true` rotates clockwise.
+pub fn rotate_canvas_pixels(src: &[u8], width: usize, height: usize, cw: bool) -> Vec<u8> {
+    let mut dst = vec![0u8; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            // CW: (x,y) -> (height-1-y, x) in a (height x width) output.
+            // CCW: (x,y) -> (y, width-1-x) in a (height x width) output.
+            let (nx, ny) = if cw { (height - 1 - y, x) } else { (y, width - 1 - x) };
+            let si = (y * width + x) * 4;
+            let new_w = height; // output buffer is height×width
+            let di = (ny * new_w + nx) * 4;
             dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
         }
     }
@@ -431,10 +463,14 @@ fn blend_mode_u32(m: suite_doc::BlendMode) -> u32 {
     }
 }
 
-/// A layer's pixels + metadata, for loading a saved project into the stack.
+/// A layer's pixels + metadata, for loading a saved project into the stack. `width`/`height`
+/// (M5) are this layer's own decoded dimensions — `replace_layers` uses the first layer's
+/// dims as the document's canonical canvas size.
 #[derive(Clone, Debug)]
 pub struct LoadedLayer {
     pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
     pub name: String,
     pub visible: bool,
     pub opacity: f32,
@@ -734,7 +770,7 @@ impl Renderer {
         drop(checker_texture);
 
         // The raster paint substrate + a bind group so PaintCanvas objects sample it.
-        let mut raster = RasterCanvas::new(&device, 1536, [0.97, 0.96, 0.94, 1.0]);
+        let mut raster = RasterCanvas::new(&device, 1536, 1536, [0.97, 0.96, 0.94, 1.0]);
         let paint_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("paint/mesh sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -758,7 +794,7 @@ impl Renderer {
         });
         // The 2D layer stack starts with one opaque paper layer (the "Background"). Upper
         // layers, added later, start transparent so they composite over what's below.
-        let mut background = RasterCanvas::new(&device, 1536, [0.97, 0.96, 0.94, 1.0]);
+        let mut background = RasterCanvas::new(&device, 1536, 1536, [0.97, 0.96, 0.94, 1.0]);
         // Paint both the display cache and the background layer to paper up-front so they
         // aren't undefined memory.
         {
@@ -1110,16 +1146,16 @@ impl Renderer {
     /// Convert a UV-space selection rect `[x0, y0, x1, y1]` to a texel-space scissor
     /// `[x, y, w, h]` for `RasterCanvas::stamp_segment`. Returns `None` when the selection
     /// is degenerate (zero area) or absent.
-    fn selection_scissor(&self, size: u32) -> Option<[u32; 4]> {
+    fn selection_scissor(&self, width: u32, height: u32) -> Option<[u32; 4]> {
         let [x0, y0, x1, y1] = self.selection_rect?;
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
-        let s = size as f32;
-        let px = (x0 * s).floor() as u32;
-        let py = (y0 * s).floor() as u32;
-        let pw = ((x1 * s).ceil() as u32).saturating_sub(px).max(1);
-        let ph = ((y1 * s).ceil() as u32).saturating_sub(py).max(1);
+        let (w, h) = (width as f32, height as f32);
+        let px = (x0 * w).floor() as u32;
+        let py = (y0 * h).floor() as u32;
+        let pw = ((x1 * w).ceil() as u32).saturating_sub(px).max(1);
+        let ph = ((y1 * h).ceil() as u32).saturating_sub(py).max(1);
         Some([px, py, pw, ph])
     }
 
@@ -1142,8 +1178,11 @@ impl Renderer {
             flow: brush.flow * pressure,
             ..*brush
         };
-        let size = self.layers[self.active_layer].canvas.size();
-        let scissor = self.selection_scissor(size);
+        let (width, height) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width(), c.height())
+        };
+        let scissor = self.selection_scissor(width, height);
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1179,7 +1218,7 @@ impl Renderer {
         // Create the per-mesh canvas lazily. Transparent start means unpainted
         // faces show the flat-shaded surface color normally.
         if !self.mesh_textures.contains_key(&obj_id) {
-            let canvas = RasterCanvas::new(&self.device, 1024, [0.0, 0.0, 0.0, 0.0]);
+            let canvas = RasterCanvas::new(&self.device, 1024, 1024, [0.0, 0.0, 0.0, 0.0]);
             // Build the bind group while we still own `canvas` and can reference its view.
             let bg = {
                 let view = canvas.texture_view();
@@ -1263,8 +1302,9 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
-    /// Replace the active layer with `pixels` (`paint_size()`²·4 RGBA8) as a single
-    /// undoable edit (used by image import). `⌘Z` reverts to the prior layer.
+    /// Replace the active layer with `pixels` (`canvas_width()×canvas_height()×4` RGBA8) as
+    /// a single undoable edit (used when an import doesn't change canvas dimensions).
+    /// `⌘Z` reverts to the prior layer.
     pub fn paint_upload_rgba_undoable(&mut self, pixels: &[u8]) {
         let mut enc = self
             .device
@@ -1278,19 +1318,22 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
-    /// The paint texture's side length in texels (square).
-    pub fn paint_size(&self) -> u32 {
-        self.raster.size()
+    /// The paint canvas's width/height in texels (M5: no longer assumed square).
+    pub fn canvas_width(&self) -> u32 {
+        self.raster.width()
+    }
+    pub fn canvas_height(&self) -> u32 {
+        self.raster.height()
     }
 
     /// GPU→CPU readback of the whole paint texture as row-major RGBA8 (top-left origin).
     /// Blocking — used on save, not in the paint loop.
     pub fn paint_readback_rgba(&self) -> Vec<u8> {
-        let size = self.raster.size();
-        let bpr = size * 4;
+        let (w, h) = (self.raster.width(), self.raster.height());
+        let bpr = w * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("paint readback"),
-            size: (bpr * size) as u64,
+            size: (bpr * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1309,12 +1352,12 @@ impl Renderer {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
-                    rows_per_image: Some(size),
+                    rows_per_image: Some(h),
                 },
             },
             wgpu::Extent3d {
-                width: size,
-                height: size,
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
             },
         );
@@ -1332,11 +1375,11 @@ impl Renderer {
     /// **linear** RGBA suitable for `Brush::color`. The stored texture is sRGB-encoded, so
     /// this sRGB-decodes the sampled texel. Blocking readback — used on a single click.
     pub fn pick_paint_color(&self, uv: [f32; 2]) -> [f32; 4] {
-        let size = self.raster.size();
+        let (w, h) = (self.raster.width(), self.raster.height());
         let pixels = self.paint_readback_rgba();
-        let x = (uv[0].clamp(0.0, 0.999) * size as f32) as u32;
-        let y = (uv[1].clamp(0.0, 0.999) * size as f32) as u32;
-        let i = ((y * size + x) * 4) as usize;
+        let x = (uv[0].clamp(0.0, 0.999) * w as f32) as u32;
+        let y = (uv[1].clamp(0.0, 0.999) * h as f32) as u32;
+        let i = ((y * w + x) * 4) as usize;
         if i + 3 >= pixels.len() {
             return [0.0, 0.0, 0.0, 1.0];
         }
@@ -1368,7 +1411,7 @@ impl Renderer {
     /// Composite all visible layers (bottom→top, alpha-over × opacity) into the display
     /// cache `self.raster` that `PaintCanvas` objects sample. Recorded into `encoder`.
     fn record_composite(&self, encoder: &mut wgpu::CommandEncoder) {
-        let size = self.raster.size();
+        let (width, height) = (self.raster.width(), self.raster.height());
         let visible: Vec<usize> =
             (0..self.layers.len()).filter(|&i| self.layers[i].visible).collect();
 
@@ -1449,7 +1492,7 @@ impl Renderer {
         encoder.copy_texture_to_texture(
             final_tex.as_image_copy(),
             self.raster.texture().as_image_copy(),
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
     }
 
@@ -1489,8 +1532,8 @@ impl Renderer {
     }
     /// Add a transparent layer above the active one and make it active.
     pub fn add_layer(&mut self) {
-        let size = self.layers[0].canvas.size();
-        let mut canvas = RasterCanvas::new(&self.device, size, [0.0, 0.0, 0.0, 0.0]);
+        let (w, h) = (self.layers[0].canvas.width(), self.layers[0].canvas.height());
+        let mut canvas = RasterCanvas::new(&self.device, w, h, [0.0, 0.0, 0.0, 0.0]);
         {
             let mut enc = self
                 .device
@@ -1553,11 +1596,11 @@ impl Renderer {
             Some(l) => &l.canvas,
             None => return Vec::new(),
         };
-        let size = canvas.size();
-        let bpr = size * 4;
+        let (w, h) = (canvas.width(), canvas.height());
+        let bpr = w * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer readback"),
-            size: (bpr * size) as u64,
+            size: (bpr * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1571,10 +1614,10 @@ impl Renderer {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
-                    rows_per_image: Some(size),
+                    rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.queue.submit(Some(enc.finish()));
         let slice = buffer.slice(..);
@@ -1583,18 +1626,63 @@ impl Renderer {
         slice.get_mapped_range().to_vec()
     }
 
-    /// Replace the whole layer stack (used on project load). Each `LoadedLayer.rgba` must be
-    /// `paint_size()²·4` bytes or it's left transparent. Resets the active layer to 0.
+    /// Build a fresh comp_a/comp_b-style scratch texture + view at `width`×`height`.
+    fn make_scratch_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    }
+
+    /// Replace the whole layer stack (used on project load). The **first** loaded layer's
+    /// dimensions become the document's canonical canvas size (M5: no longer forced square);
+    /// `raster`/`comp_a`/`comp_b` are recreated to match. A layer whose buffer doesn't match
+    /// its own recorded dims is left transparent (defends against a corrupt blob). Resets the
+    /// active layer to 0.
     pub fn replace_layers(&mut self, loaded: Vec<LoadedLayer>) {
         if loaded.is_empty() {
             return;
         }
-        let size = self.paint_size();
-        let expected = (size * size * 4) as usize;
+        let (doc_w, doc_h) = (loaded[0].width.max(1), loaded[0].height.max(1));
+
+        // Recreate the display cache + comp buffers to match the loaded document's canvas.
+        self.raster = RasterCanvas::new(&self.device, doc_w, doc_h, [0.97, 0.96, 0.94, 1.0]);
+        let (comp_a, comp_a_view) = Self::make_scratch_texture(&self.device, doc_w, doc_h, "layer comp a");
+        let (comp_b, comp_b_view) = Self::make_scratch_texture(&self.device, doc_w, doc_h, "layer comp b");
+        self.comp_a = comp_a;
+        self.comp_a_view = comp_a_view;
+        self.comp_b = comp_b;
+        self.comp_b_view = comp_b_view;
+        {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("load canvas clear") });
+            self.raster.clear(&mut enc);
+            self.queue.submit(Some(enc.finish()));
+        }
+        // The paint bind group holds a view into `self.raster`'s old texture — rebuild it.
+        self.paint_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint bind group"),
+            layout: &self.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(self.raster.texture_view()) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+            ],
+        });
+
         let mut layers = Vec::with_capacity(loaded.len());
         for l in loaded {
-            let mut canvas = RasterCanvas::new(&self.device, size, [0.0, 0.0, 0.0, 0.0]);
-            if l.rgba.len() == expected {
+            let expected = (l.width as usize) * (l.height as usize) * 4;
+            let mut canvas = RasterCanvas::new(&self.device, doc_w, doc_h, [0.0, 0.0, 0.0, 0.0]);
+            if l.rgba.len() == expected && l.width == doc_w && l.height == doc_h {
                 canvas.upload_rgba(&self.queue, &l.rgba);
             } else {
                 let mut enc = self
@@ -1610,6 +1698,89 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
+    /// **M5**: replace the entire paint substrate (display cache, comp buffers, and the
+    /// layer stack — collapsed to one Background layer) with `pixels` at `width`×`height`.
+    /// Used by "Import Image" so the canvas takes the image's own aspect ratio instead of
+    /// being forced into the old fixed square. Not undoable (like opening a project, this
+    /// is a hard reset of the paint substrate — the prior canvas's dimensions are gone).
+    pub fn import_replace_canvas(&mut self, width: u32, height: u32, pixels: &[u8]) {
+        let (w, h) = (width.max(1), height.max(1));
+        self.raster = RasterCanvas::new(&self.device, w, h, [0.97, 0.96, 0.94, 1.0]);
+        let (comp_a, comp_a_view) = Self::make_scratch_texture(&self.device, w, h, "layer comp a");
+        let (comp_b, comp_b_view) = Self::make_scratch_texture(&self.device, w, h, "layer comp b");
+        self.comp_a = comp_a;
+        self.comp_a_view = comp_a_view;
+        self.comp_b = comp_b;
+        self.comp_b_view = comp_b_view;
+        self.paint_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint bind group"),
+            layout: &self.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(self.raster.texture_view()) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+            ],
+        });
+
+        let mut canvas = RasterCanvas::new(&self.device, w, h, [0.97, 0.96, 0.94, 1.0]);
+        canvas.upload_rgba(&self.queue, pixels);
+        self.layers = vec![PaintLayer {
+            canvas,
+            name: "Background".to_string(),
+            visible: true,
+            opacity: 1.0,
+            blend: suite_doc::BlendMode::Normal,
+        }];
+        self.active_layer = 0;
+        self.layers_dirty = true;
+    }
+
+    /// **M5**: rotate the whole document 90° (every layer + the comp/display buffers
+    /// together), swapping the canvas's width↔height. A per-layer rotate can't do this
+    /// safely once the canvas may be non-square — see `LayerTransform`'s doc comment.
+    /// Not undoable (a structural resize, same posture as `import_replace_canvas`).
+    pub fn rotate_canvas_90(&mut self, dir: CanvasRotate) {
+        let cw = matches!(dir, CanvasRotate::Cw);
+        let (old_w, old_h) = (self.raster.width() as usize, self.raster.height() as usize);
+        let (new_w, new_h) = (old_h as u32, old_w as u32);
+
+        // Drain layers 0-first: each iteration reads layer 0's pixels, rotates them, THEN
+        // removes layer 0 — reading `layer_pixels(i)` against the shrinking vec instead
+        // would desync the pixels from the wrong layer's metadata after the first removal.
+        let n = self.layers.len();
+        let mut rotated_layers: Vec<(Vec<u8>, PaintLayer)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let src = self.layer_pixels(0);
+            let rotated = rotate_canvas_pixels(&src, old_w, old_h, cw);
+            rotated_layers.push((rotated, self.layers.remove(0)));
+        }
+
+        self.raster = RasterCanvas::new(&self.device, new_w, new_h, [0.97, 0.96, 0.94, 1.0]);
+        let (comp_a, comp_a_view) = Self::make_scratch_texture(&self.device, new_w, new_h, "layer comp a");
+        let (comp_b, comp_b_view) = Self::make_scratch_texture(&self.device, new_w, new_h, "layer comp b");
+        self.comp_a = comp_a;
+        self.comp_a_view = comp_a_view;
+        self.comp_b = comp_b;
+        self.comp_b_view = comp_b_view;
+        self.paint_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paint bind group"),
+            layout: &self.texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(self.raster.texture_view()) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+            ],
+        });
+
+        self.layers = rotated_layers
+            .into_iter()
+            .map(|(pixels, old)| {
+                let mut canvas = RasterCanvas::new(&self.device, new_w, new_h, [0.0, 0.0, 0.0, 0.0]);
+                canvas.upload_rgba(&self.queue, &pixels);
+                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend }
+            })
+            .collect();
+        self.layers_dirty = true;
+    }
+
     /// **Magic wand**: flood-fill from `seed_uv` on the paint canvas, selecting pixels
     /// within `tolerance` (0–1 per channel) of the seed color. Fills the selection with
     /// `fill_color` (RGBA linear, pre-multiplied alpha) and re-uploads the result.
@@ -1619,12 +1790,12 @@ impl Renderer {
     /// *Upgrade path:* replace the flood-fill heuristic with SAM (Segment Anything Model)
     /// via the `ort` ONNX runtime once a model download can be authorized.
     pub fn paint_magic_wand_fill(&mut self, seed_uv: [f32; 2], tolerance: f32, fill_color: [f32; 4]) -> usize {
-        let size = self.raster.size() as usize;
+        let (width, height) = (self.raster.width() as usize, self.raster.height() as usize);
         let mut pixels = self.paint_readback_rgba();
 
-        let px = (seed_uv[0].clamp(0.0, 0.9999) * size as f32) as usize;
-        let py = (seed_uv[1].clamp(0.0, 0.9999) * size as f32) as usize;
-        let seed_idx = (py * size + px) * 4;
+        let px = (seed_uv[0].clamp(0.0, 0.9999) * width as f32) as usize;
+        let py = (seed_uv[1].clamp(0.0, 0.9999) * height as f32) as usize;
+        let seed_idx = (py * width + px) * 4;
 
         // Copy seed color into scalars to avoid borrowing pixels in the BFS loop.
         let (seed_r, seed_g, seed_b, seed_a) = (
@@ -1640,18 +1811,18 @@ impl Renderer {
         let fill_a = (fill_color[3].clamp(0.0, 1.0) * 255.0) as u8;
 
         // BFS flood fill.
-        let mut visited = vec![false; size * size];
+        let mut visited = vec![false; width * height];
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((px as isize, py as isize));
         let mut count = 0usize;
 
         while let Some((x, y)) = queue.pop_front() {
-            if x < 0 || y < 0 || x >= size as isize || y >= size as isize {
+            if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
                 continue;
             }
             let xi = x as usize;
             let yi = y as usize;
-            let flat = yi * size + xi;
+            let flat = yi * width + xi;
             if visited[flat] {
                 continue;
             }
@@ -1690,11 +1861,11 @@ impl Renderer {
     /// `Rgba8UnormSrgb`, so the returned bytes are sRGB-encoded.
     fn read_active_layer_rgba(&self) -> Vec<u8> {
         let canvas = &self.layers[self.active_layer].canvas;
-        let size = canvas.size();
-        let bpr = size * 4;
+        let (w, h) = (canvas.width(), canvas.height());
+        let bpr = w * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer readback"),
-            size: (bpr * size) as u64,
+            size: (bpr * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1708,10 +1879,10 @@ impl Renderer {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
-                    rows_per_image: Some(size),
+                    rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.queue.submit(Some(enc.finish()));
         let slice = buffer.slice(..);
@@ -1746,11 +1917,15 @@ impl Renderer {
         color_b: [f32; 4],
         radial: bool,
     ) {
-        let size = self.layers[self.active_layer].canvas.size() as usize;
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
         let mut pixels = self.read_active_layer_rgba();
         apply_gradient_fill(
             &mut pixels,
-            size,
+            w,
+            h,
             from_uv,
             to_uv,
             color_a,
@@ -1761,13 +1936,16 @@ impl Renderer {
         self.write_active_layer_undoable(&pixels);
     }
 
-    /// **Layer transform** on the active layer's pixels: flip/rotate the whole canvas as a
-    /// single undoable edit. Operates on a CPU readback then re-uploads. (Canvas is square,
-    /// so 90° rotations keep the same dimensions.)
+    /// **Layer transform** on the active layer's pixels: flip/180°-rotate as a single
+    /// undoable edit. Operates on a CPU readback then re-uploads. Always dimension-preserving
+    /// (see `LayerTransform`'s doc comment) — a 90° rotation is `rotate_canvas_90` instead.
     pub fn transform_active_layer(&mut self, op: LayerTransform) {
-        let size = self.layers[self.active_layer].canvas.size() as usize;
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
         let src = self.read_active_layer_rgba();
-        let dst = apply_layer_transform(&src, size, op);
+        let dst = apply_layer_transform(&src, w, h, op);
         self.write_active_layer_undoable(&dst);
     }
 
@@ -2707,14 +2885,16 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, LayerTransform};
+    use super::{apply_gradient_fill, apply_layer_transform, rotate_canvas_pixels, LayerTransform};
 
-    /// A 4×4 buffer where each texel encodes its (x,y) into R,G so transforms are verifiable.
-    fn ramp(size: usize) -> Vec<u8> {
-        let mut v = vec![0u8; size * size * 4];
-        for y in 0..size {
-            for x in 0..size {
-                let i = (y * size + x) * 4;
+    /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
+    /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
+    /// that a square fixture would hide.
+    fn ramp(width: usize, height: usize) -> Vec<u8> {
+        let mut v = vec![0u8; width * height * 4];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * 4;
                 v[i] = (x * 10) as u8;
                 v[i + 1] = (y * 10) as u8;
                 v[i + 2] = 0;
@@ -2724,67 +2904,74 @@ mod m4_tests {
         v
     }
 
-    fn px(buf: &[u8], size: usize, x: usize, y: usize) -> [u8; 4] {
-        let i = (y * size + x) * 4;
+    fn px(buf: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * width + x) * 4;
         [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
     }
 
     #[test]
-    fn flip_h_mirrors_columns() {
-        let size = 4;
-        let src = ramp(size);
-        let out = apply_layer_transform(&src, size, LayerTransform::FlipH);
-        // Column 0 of the source (R=0) lands in column 3.
-        assert_eq!(px(&out, size, 3, 1), px(&src, size, 0, 1));
-        assert_eq!(px(&out, size, 0, 1), px(&src, size, 3, 1));
+    fn flip_h_mirrors_columns_on_a_non_square_buffer() {
+        let (w, h) = (6, 3);
+        let src = ramp(w, h);
+        let out = apply_layer_transform(&src, w, h, LayerTransform::FlipH);
+        // Column 0 of the source (R=0) lands in the last column (w-1).
+        assert_eq!(px(&out, w, w - 1, 1), px(&src, w, 0, 1));
+        assert_eq!(px(&out, w, 0, 1), px(&src, w, w - 1, 1));
     }
 
     #[test]
-    fn flip_v_mirrors_rows() {
-        let size = 4;
-        let src = ramp(size);
-        let out = apply_layer_transform(&src, size, LayerTransform::FlipV);
-        assert_eq!(px(&out, size, 2, 3), px(&src, size, 2, 0));
+    fn flip_v_mirrors_rows_on_a_non_square_buffer() {
+        let (w, h) = (6, 3);
+        let src = ramp(w, h);
+        let out = apply_layer_transform(&src, w, h, LayerTransform::FlipV);
+        assert_eq!(px(&out, w, 2, h - 1), px(&src, w, 2, 0));
     }
 
     #[test]
-    fn rotate_90_cw_then_ccw_is_identity() {
-        let size = 4;
-        let src = ramp(size);
-        let cw = apply_layer_transform(&src, size, LayerTransform::Rotate90Cw);
-        let back = apply_layer_transform(&cw, size, LayerTransform::Rotate90Ccw);
-        assert_eq!(src, back, "CW then CCW must restore the original");
-    }
-
-    #[test]
-    fn rotate_180_twice_is_identity() {
-        let size = 4;
-        let src = ramp(size);
-        let once = apply_layer_transform(&src, size, LayerTransform::Rotate180);
-        let twice = apply_layer_transform(&once, size, LayerTransform::Rotate180);
+    fn rotate_180_twice_is_identity_on_a_non_square_buffer() {
+        let (w, h) = (6, 3);
+        let src = ramp(w, h);
+        let once = apply_layer_transform(&src, w, h, LayerTransform::Rotate180);
+        let twice = apply_layer_transform(&once, w, h, LayerTransform::Rotate180);
         assert_eq!(src, twice);
     }
 
+    /// M5: `rotate_canvas_pixels` is the whole-DOCUMENT 90° rotate — it swaps width↔height
+    /// in its OUTPUT, unlike `apply_layer_transform`'s three dimension-preserving ops.
     #[test]
-    fn rotate_90_cw_maps_top_left_to_top_right() {
-        let size = 4;
-        let src = ramp(size); // top-left (0,0) has R=0,G=0
-        let out = apply_layer_transform(&src, size, LayerTransform::Rotate90Cw);
-        // CW: (x,y) -> (size-1-y, x). (0,0) -> (3,0).
-        assert_eq!(px(&out, size, 3, 0), px(&src, size, 0, 0));
+    fn rotate_canvas_cw_then_ccw_is_identity() {
+        let (w, h) = (6, 3);
+        let src = ramp(w, h);
+        let cw = rotate_canvas_pixels(&src, w, h, true);
+        assert_eq!(cw.len(), h * w * 4, "CW output is the same total pixel count, swapped dims");
+        // Rotating the (h×w) result back CCW, using the now-swapped dims, restores the original.
+        let back = rotate_canvas_pixels(&cw, h, w, false);
+        assert_eq!(src, back, "CW then CCW (with swapped dims) must restore the original");
     }
 
     #[test]
-    fn linear_gradient_is_opaque_at_start_and_transparent_at_end() {
-        // Opaque white → transparent across a 16-wide canvas on a black opaque background.
-        let size = 16;
-        let mut buf = vec![0u8; size * size * 4];
+    fn rotate_canvas_cw_maps_top_left_to_top_right() {
+        let (w, h) = (6, 3);
+        let src = ramp(w, h); // top-left (0,0) has R=0,G=0
+        let out = rotate_canvas_pixels(&src, w, h, true);
+        // CW into a (h×w) buffer: (0,0) -> (h-1, 0).
+        let out_w = h;
+        assert_eq!(px(&out, out_w, h - 1, 0), px(&src, w, 0, 0));
+    }
+
+    #[test]
+    fn linear_gradient_is_opaque_at_start_and_transparent_at_end_on_non_square() {
+        // Opaque white → transparent across a 16-wide, 8-tall canvas on a black background —
+        // non-square on purpose, so a width/height mixup in the gradient math would show up.
+        let (w, h) = (16, 8);
+        let mut buf = vec![0u8; w * h * 4];
         for p in buf.chunks_mut(4) {
             p[3] = 255; // black, opaque
         }
         apply_gradient_fill(
             &mut buf,
-            size,
+            w,
+            h,
             [0.0, 0.5],
             [1.0, 0.5],
             [1.0, 1.0, 1.0, 1.0], // white, opaque at start
@@ -2792,30 +2979,32 @@ mod m4_tests {
             false,
             None,
         );
+        let mid_row = h / 2;
         // Far-left column: gradient alpha ~1 → fully white.
-        let left = px(&buf, size, 0, 8);
+        let left = px(&buf, w, 0, mid_row);
         assert!(left[0] > 230, "left edge should be near-white, got {left:?}");
         // Mid column: ~50% blend → a clear mid-grey, darker than the left.
-        let mid = px(&buf, size, size / 2, 8);
+        let mid = px(&buf, w, w / 2, mid_row);
         assert!(mid[0] < left[0] && mid[0] > 60, "middle should be mid-grey, got {mid:?}");
         // Far-right column: alpha ~0, so mostly the black background shows through. (Not
         // pure black: the last texel centre sits at t≈0.97, leaving a few % of white that
         // sRGB encoding lifts — so assert "much darker than the middle", not "near zero".)
-        let right = px(&buf, size, size - 1, 8);
+        let right = px(&buf, w, w - 1, mid_row);
         assert!(right[0] < mid[0] / 2, "right edge should fall off hard, got {right:?} vs mid {mid:?}");
     }
 
     #[test]
     fn gradient_respects_selection_bounds() {
         // Fill solid red but restrict to the left half via a selection; right half untouched.
-        let size = 16;
-        let mut buf = vec![0u8; size * size * 4];
+        let (w, h) = (16, 16);
+        let mut buf = vec![0u8; w * h * 4];
         for p in buf.chunks_mut(4) {
             p[3] = 255; // opaque black
         }
         apply_gradient_fill(
             &mut buf,
-            size,
+            w,
+            h,
             [0.0, 0.5],
             [0.0, 0.5], // zero-length → t=0 everywhere → color_a
             [1.0, 0.0, 0.0, 1.0],
@@ -2823,9 +3012,9 @@ mod m4_tests {
             false,
             Some([0.0, 0.0, 0.5, 1.0]), // left half only
         );
-        let inside = px(&buf, size, 2, 8);
+        let inside = px(&buf, w, 2, 8);
         assert!(inside[0] > 200 && inside[1] < 40, "inside selection is red, got {inside:?}");
-        let outside = px(&buf, size, 12, 8);
+        let outside = px(&buf, w, 12, 8);
         assert_eq!(outside, [0, 0, 0, 255], "outside selection stays untouched");
     }
 }

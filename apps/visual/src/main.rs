@@ -23,6 +23,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+/// M5: an imported image's canvas takes its own native aspect ratio (no more forced-square
+/// padding) — this just bounds an oversized source image's VRAM footprint.
+const MAX_IMPORT_DIM: u32 = 4096;
+
 struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -110,6 +114,37 @@ impl App {
         }
     }
 
+    /// M5: rescale every `PaintCanvas` object's world footprint to match `width`×`height`'s
+    /// aspect ratio, keeping the longer side at 3.0 world units (the starter-scene artboard
+    /// convention) and shrinking the shorter side proportionally. Without this, a non-square
+    /// canvas would still render squished into the old fixed 1:1 quad — the pixels/UVs would
+    /// be correct, but the on-screen presentation wrong. Called after any op that changes the
+    /// canvas's overall dimensions (image import, canvas rotate).
+    ///
+    /// Takes `&mut Document` directly (not `&mut self`) so callers holding a live
+    /// `&mut Renderer` borrowed from `self.renderer` can still call this — it borrows only
+    /// the disjoint `self.document` field via `&mut self.document`, not all of `self`.
+    fn rescale_paint_canvases_to_aspect(doc: &mut Document, width: u32, height: u32) {
+        const LONG_SIDE: f32 = 3.0;
+        let aspect = width.max(1) as f32 / height.max(1) as f32;
+        let (sx, sy) = if aspect >= 1.0 {
+            (LONG_SIDE, LONG_SIDE / aspect)
+        } else {
+            (LONG_SIDE * aspect, LONG_SIDE)
+        };
+        let ids: Vec<ObjId> = doc
+            .objects()
+            .filter(|o| o.kind == suite_doc::ObjectKind::PaintCanvas)
+            .map(|o| o.id)
+            .collect();
+        for id in ids {
+            if let Some(obj) = doc.get_mut(id) {
+                obj.transform.scale.x = sx;
+                obj.transform.scale.y = sy;
+            }
+        }
+    }
+
     /// Clear all undo bookkeeping. Called when the document is replaced (New/Open) so the
     /// unified order doesn't point at history that no longer exists.
     fn reset_undo_state(&mut self) {
@@ -126,12 +161,13 @@ impl App {
     /// Read back every layer's pixels + metadata for saving the full stack.
     fn current_layers(&self) -> Vec<persistence::LayerSave> {
         let Some(r) = self.renderer.as_ref() else { return Vec::new() };
-        let size = r.paint_size();
+        let (width, height) = (r.canvas_width(), r.canvas_height());
         let infos = r.layer_infos();
         (0..infos.len())
             .map(|i| persistence::LayerSave {
                 rgba: r.layer_pixels(i),
-                size,
+                width,
+                height,
                 name: infos[i].name.clone(),
                 visible: infos[i].visible,
                 opacity: infos[i].opacity,
@@ -174,6 +210,8 @@ impl App {
                                     .into_iter()
                                     .map(|l| suite_gpu::LoadedLayer {
                                         rgba: l.rgba,
+                                        width: l.width,
+                                        height: l.height,
                                         name: l.name,
                                         visible: l.visible,
                                         opacity: l.opacity,
@@ -222,16 +260,21 @@ impl App {
                 }
             }
             FileAction::ImportImage => {
-                let size = self.renderer.as_ref().map(|r| r.paint_size()).unwrap_or(0);
-                if size > 0 {
-                    if let Some((rgba, status)) = persistence::import_image_dialog(size) {
+                if self.renderer.is_some() {
+                    if let Some(((w, h), rgba, status)) = persistence::import_image_dialog(MAX_IMPORT_DIM) {
                         if !rgba.is_empty() {
                             if let Some(r) = self.renderer.as_mut() {
-                                // One undoable edit: ⌘Z reverts to the prior canvas.
-                                r.paint_upload_rgba_undoable(&rgba);
-                                self.undo_order.push(UndoKind::Paint);
+                                // M5: the canvas takes the image's own aspect ratio. This is a
+                                // structural resize (like opening a project), not a single
+                                // undoable stroke — it replaces the whole paint substrate, so
+                                // there's no prior-canvas-of-this-size to revert to. Clear the
+                                // undo/redo queues too so a later ⌘Z doesn't hit a stale
+                                // now-inert Paint entry from before the resize.
+                                r.import_replace_canvas(w, h, &rgba);
+                                self.undo_order.clear();
                                 self.redo_order.clear();
                             }
+                            Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
                             self.shell.dirty = true;
                         }
                         self.shell.status = status;
@@ -241,8 +284,8 @@ impl App {
             FileAction::ExportPng => {
                 if let Some(r) = self.renderer.as_ref() {
                     let rgba = r.paint_readback_rgba();
-                    let size = r.paint_size();
-                    if let Some(status) = persistence::export_png_dialog(&rgba, size) {
+                    let (width, height) = (r.canvas_width(), r.canvas_height());
+                    if let Some(status) = persistence::export_png_dialog(&rgba, width, height) {
                         self.shell.status = status;
                     }
                 }
@@ -311,12 +354,12 @@ impl ApplicationHandler for App {
         // Drain a command-line image import (e.g. `suite-visual photo.jpg`).
         if let Some(path) = self.pending_startup_image.take() {
             if let Some(r) = self.renderer.as_mut() {
-                let size = r.paint_size();
-                match persistence::import_image_from(&path, size) {
-                    Ok(rgba) => {
-                        r.paint_upload_rgba_undoable(&rgba);
-                        self.undo_order.push(UndoKind::Paint);
+                match persistence::import_image_from(&path, MAX_IMPORT_DIM) {
+                    Ok((w, h, rgba)) => {
+                        r.import_replace_canvas(w, h, &rgba);
+                        self.undo_order.clear();
                         self.redo_order.clear();
+                        Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
                         self.shell.dirty = true;
                         self.shell.status = format!("Imported {}", path.display());
                         // Switch to the paint tool + ortho so the imported image is framed.
@@ -368,12 +411,12 @@ impl ApplicationHandler for App {
             // This must happen before the renderer borrow below.
             if let Some(renderer) = self.renderer.as_ref() {
                 let pixels = renderer.paint_readback_rgba();
-                let size = renderer.paint_size();
+                let (width, height) = (renderer.canvas_width(), renderer.canvas_height());
                 let res = self.shell.heightmap_resolution;
                 let scale = self.shell.heightmap_scale;
                 self.document.checkpoint(&[]);
                 let id = self.document.add_heightmap_mesh(
-                    &pixels, size, size, res, scale, glam::Vec3::new(0.0, 0.0, -1.5),
+                    &pixels, width, height, res, scale, glam::Vec3::new(0.0, 0.0, -1.5),
                 );
                 self.document.set_selection(Some(id));
                 self.shell.dirty = true;
@@ -890,10 +933,23 @@ impl ApplicationHandler for App {
                     window.request_redraw();
                 }
 
-                // Apply a layer transform (M4 flip/rotate) issued by an inspector button.
+                // Apply a layer transform (M4 flip/180°) issued by an inspector button.
                 if let Some(op) = self.shell.pending_layer_transform.take() {
                     renderer.transform_active_layer(op);
                     self.undo_order.push(UndoKind::Paint);
+                    self.redo_order.clear();
+                    self.shell.dirty = true;
+                    window.request_redraw();
+                }
+
+                // Apply a whole-canvas 90° rotate (M5) issued by an inspector button. Not
+                // undoable — it's a structural resize like opening a project, not a stroke;
+                // clear the undo/redo queues so a later ⌘Z doesn't hit a stale no-op entry.
+                if let Some(dir) = self.shell.pending_canvas_rotate.take() {
+                    renderer.rotate_canvas_90(dir);
+                    let (w, h) = (renderer.canvas_width(), renderer.canvas_height());
+                    Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
+                    self.undo_order.clear();
                     self.redo_order.clear();
                     self.shell.dirty = true;
                     window.request_redraw();

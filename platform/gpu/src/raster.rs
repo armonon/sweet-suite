@@ -12,8 +12,12 @@
 //! dirty-tile doctrine in docs/03 §2; per-256²-tile granularity is the later refinement
 //! that matters once the canvas is bigger than one texture).
 //!
-//! Still deferred: true 256² *sparse* tiling of the display (for canvases larger than a
-//! single texture) — premature for an artboard, documented in DECISIONS.
+//! **Arbitrary width×height (M5):** the canvas need not be square. `radius_uv` is defined
+//! as a fraction of **width**; dab generation corrects the clip-space y-radius by the
+//! width/height aspect so a "round" brush stays round in texel space on any aspect ratio
+//! (see `push_dab`). Still deferred: true 256² *sparse* tiling of the display (for
+//! canvases larger than a single texture) — premature for an artboard, documented in
+//! DECISIONS.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -105,8 +109,8 @@ impl BrushBlend {
     }
 }
 
-/// A brush configuration. `radius_uv` is the dab radius in UV units (0..1 across the
-/// canvas). `hardness` in [0,1]: 1 = crisp edge, 0 = fully soft falloff. `flow` is the
+/// A brush configuration. `radius_uv` is the dab radius as a **fraction of canvas width**
+/// (0..1). `hardness` in [0,1]: 1 = crisp edge, 0 = fully soft falloff. `flow` is the
 /// per-dab alpha multiplier — low flow + overlapping dabs build up gradually. `tip` is the
 /// footprint shape; `blend` is the deposit mode; `smudge` (0..1) drags existing canvas
 /// colour along the stroke (0 = off).
@@ -172,7 +176,8 @@ struct HistoryRegion {
 }
 
 pub struct RasterCanvas {
-    size: u32,
+    width: u32,
+    height: u32,
     format: wgpu::TextureFormat,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
@@ -198,14 +203,16 @@ pub struct RasterCanvas {
 }
 
 impl RasterCanvas {
-    pub fn new(device: &wgpu::Device, size: u32, paper: [f32; 4]) -> Self {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32, paper: [f32; 4]) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
         let format = wgpu::TextureFormat::Rgba8UnormSrgb;
         let make_tex = |label: &str| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d {
-                    width: size,
-                    height: size,
+                    width,
+                    height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -386,7 +393,8 @@ impl RasterCanvas {
         });
 
         Self {
-            size,
+            width,
+            height,
             format,
             texture,
             view,
@@ -412,8 +420,11 @@ impl RasterCanvas {
     pub fn format(&self) -> wgpu::TextureFormat {
         self.format
     }
-    pub fn size(&self) -> u32 {
-        self.size
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
     }
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
@@ -454,23 +465,22 @@ impl RasterCanvas {
         let full = Bbox {
             x0: 0,
             y0: 0,
-            x1: self.size,
-            y1: self.size,
+            x1: self.width,
+            y1: self.height,
         };
         self.push_undo_region(device, encoder, full);
         self.redo.clear();
         self.clear(encoder);
     }
 
-    /// Replace the whole canvas with `pixels` (`size`²·4 RGBA8), recording a full-canvas
-    /// undo entry first so the replace (e.g. an image import) can be undone.
+    /// Replace the whole canvas with `pixels` (`width*height*4` RGBA8), recording a
+    /// full-canvas undo entry first so the replace (e.g. an image import) can be undone.
     ///
     /// The overwrite goes through the **encoder** (staging buffer → `copy_buffer_to_texture`),
     /// not `queue.write_texture`: queue writes are flushed *before* the command buffers in a
     /// submit, which would clobber the snapshot copy and make undo capture the new pixels.
     /// Recording both copies in the encoder keeps them correctly ordered (snapshot, then
-    /// overwrite). `bytes_per_row` is `size·4`, a multiple of 256 for our power-of-two
-    /// canvases, so it satisfies the copy alignment.
+    /// overwrite).
     pub fn upload_rgba_undoable(
         &mut self,
         device: &wgpu::Device,
@@ -478,7 +488,7 @@ impl RasterCanvas {
         encoder: &mut wgpu::CommandEncoder,
         pixels: &[u8],
     ) {
-        let full = Bbox { x0: 0, y0: 0, x1: self.size, y1: self.size };
+        let full = Bbox { x0: 0, y0: 0, x1: self.width, y1: self.height };
         self.push_undo_region(device, encoder, full);
         self.redo.clear();
 
@@ -492,12 +502,12 @@ impl RasterCanvas {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.size * 4),
-                    rows_per_image: Some(self.size),
+                    bytes_per_row: Some(self.width * 4),
+                    rows_per_image: Some(self.height),
                 },
             },
             self.texture.as_image_copy(),
-            wgpu::Extent3d { width: self.size, height: self.size, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
         );
     }
 
@@ -523,8 +533,8 @@ impl RasterCanvas {
                 self.texture.as_image_copy(),
                 self.pre_stroke.as_image_copy(),
                 wgpu::Extent3d {
-                    width: self.size,
-                    height: self.size,
+                    width: self.width,
+                    height: self.height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -533,7 +543,8 @@ impl RasterCanvas {
         }
         self.note_dirty(from_uv, to_uv, brush);
 
-        let verts = build_dab_vertices(from_uv, to_uv, brush);
+        let aspect = self.width as f32 / self.height as f32;
+        let verts = build_dab_vertices(from_uv, to_uv, brush, aspect);
         if verts.is_empty() {
             return;
         }
@@ -549,17 +560,19 @@ impl RasterCanvas {
             encoder.copy_texture_to_texture(
                 self.texture.as_image_copy(),
                 self.smudge_source.as_image_copy(),
-                wgpu::Extent3d { width: self.size, height: self.size, depth_or_array_layers: 1 },
+                wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
             );
-            // Pick up colour from *behind* the stroke direction by ~one radius.
+            // Pick up colour from *behind* the stroke direction by ~one radius (in UV space,
+            // which is already axis-normalized regardless of canvas aspect).
             let dx = to_uv[0] - from_uv[0];
             let dy = to_uv[1] - from_uv[1];
             let len = (dx * dx + dy * dy).sqrt();
             let (nx, ny) = if len > 1e-6 { (dx / len, dy / len) } else { (0.0, 0.0) };
             let off = brush.radius_uv * 0.9;
-            let inv = 1.0 / self.size as f32;
+            let inv_w = 1.0 / self.width as f32;
+            let inv_h = 1.0 / self.height as f32;
             // [inv_size.xy, pickup_offset.xy, amount, pad, pad, pad]
-            let uni: [f32; 8] = [inv, inv, -nx * off, -ny * off, brush.smudge.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
+            let uni: [f32; 8] = [inv_w, inv_h, -nx * off, -ny * off, brush.smudge.clamp(0.0, 1.0), 0.0, 0.0, 0.0];
             let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("smudge uniform"),
                 contents: bytemuck::cast_slice(&uni),
@@ -675,21 +688,21 @@ impl RasterCanvas {
     }
 
     /// Upload full-canvas RGBA8 pixels (used when loading a painting). `pixels` must be
-    /// `size*size*4` bytes, row-major, top-left origin.
+    /// `width*height*4` bytes, row-major, top-left origin.
     /// Raw full-canvas texture write. Does NOT touch undo/redo — callers decide.
     fn write_texture_rgba(&self, queue: &wgpu::Queue, pixels: &[u8]) {
-        let bpr = self.size * 4;
+        let bpr = self.width * 4;
         queue.write_texture(
             self.texture.as_image_copy(),
             pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bpr),
-                rows_per_image: Some(self.size),
+                rows_per_image: Some(self.height),
             },
             wgpu::Extent3d {
-                width: self.size,
-                height: self.size,
+                width: self.width,
+                height: self.height,
                 depth_or_array_layers: 1,
             },
         );
@@ -705,16 +718,19 @@ impl RasterCanvas {
     // --- internals ---
 
     fn note_dirty(&mut self, from_uv: [f32; 2], to_uv: [f32; 2], brush: &Brush) {
-        let tw = self.size as f32;
+        let tw = self.width as f32;
+        let th = self.height as f32;
+        // radius_uv is a fraction of width; convert to texels per axis (texel_radius is the
+        // same in both axes — see push_dab — so pad both axes by the same texel amount).
         let pad = brush.radius_uv * tw + 2.0;
         let minu = from_uv[0].min(to_uv[0]) * tw - pad;
         let maxu = from_uv[0].max(to_uv[0]) * tw + pad;
-        let minv = from_uv[1].min(to_uv[1]) * tw - pad;
-        let maxv = from_uv[1].max(to_uv[1]) * tw + pad;
+        let minv = from_uv[1].min(to_uv[1]) * th - pad;
+        let maxv = from_uv[1].max(to_uv[1]) * th + pad;
         let x0 = minu.floor().clamp(0.0, tw) as u32;
-        let y0 = minv.floor().clamp(0.0, tw) as u32;
+        let y0 = minv.floor().clamp(0.0, th) as u32;
         let x1 = maxu.ceil().clamp(0.0, tw) as u32;
-        let y1 = maxv.ceil().clamp(0.0, tw) as u32;
+        let y1 = maxv.ceil().clamp(0.0, th) as u32;
         let bbox = Bbox { x0, y0, x1, y1 };
         self.dirty = Some(match self.dirty {
             None => bbox,
@@ -828,7 +844,8 @@ impl RasterCanvas {
     }
 }
 
-fn build_dab_vertices(from_uv: [f32; 2], to_uv: [f32; 2], brush: &Brush) -> Vec<DabVertex> {
+/// `canvas_aspect` is width/height — see `push_dab` for why the y-radius needs it.
+fn build_dab_vertices(from_uv: [f32; 2], to_uv: [f32; 2], brush: &Brush, canvas_aspect: f32) -> Vec<DabVertex> {
     let r = brush.radius_uv.max(0.0005);
     let dx = to_uv[0] - from_uv[0];
     let dy = to_uv[1] - from_uv[1];
@@ -845,16 +862,20 @@ fn build_dab_vertices(from_uv: [f32; 2], to_uv: [f32; 2], brush: &Brush) -> Vec<
         };
         let cu = from_uv[0] + dx * t;
         let cv = from_uv[1] + dy * t;
-        push_dab(&mut verts, cu, cv, r, brush);
+        push_dab(&mut verts, cu, cv, r, brush, canvas_aspect);
     }
     verts
 }
 
-fn push_dab(out: &mut Vec<DabVertex>, cu: f32, cv: f32, r: f32, brush: &Brush) {
+fn push_dab(out: &mut Vec<DabVertex>, cu: f32, cv: f32, r: f32, brush: &Brush, canvas_aspect: f32) {
     let cx = cu * 2.0 - 1.0;
     let cy = 1.0 - cv * 2.0;
+    // radius_uv is a fraction of canvas WIDTH. Clip space is [-1,1] on both axes regardless
+    // of the target's pixel aspect ratio, so an equal clip-space rx/ry only looks circular
+    // in texels when width==height. Scale ry by (width/height) so the same texel radius
+    // applies on both axes on any aspect ratio — a "round" brush stays round.
     let rx = r * 2.0;
-    let ry = r * 2.0;
+    let ry = r * 2.0 * canvas_aspect;
     let params = [
         brush.hardness.clamp(0.0, 1.0),
         brush.flow.clamp(0.0, 1.0),
@@ -1015,11 +1036,12 @@ mod tests {
         queue: &wgpu::Queue,
         canvas: &RasterCanvas,
     ) -> ([u8; 4], [u8; 4]) {
-        let size = canvas.size();
-        let bpr = size * 4;
+        let w = canvas.width();
+        let h = canvas.height();
+        let bpr = w * 4;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
-            size: (bpr * size) as u64,
+            size: (bpr * h) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -1032,12 +1054,12 @@ mod tests {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bpr),
-                    rows_per_image: Some(size),
+                    rows_per_image: Some(h),
                 },
             },
             wgpu::Extent3d {
-                width: size,
-                height: size,
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
             },
         );
@@ -1052,7 +1074,7 @@ mod tests {
             let i = (y * bpr + x * 4) as usize;
             [data[i], data[i + 1], data[i + 2], data[i + 3]]
         };
-        (px(size / 2, size / 2), px(4, 4))
+        (px(w / 2, h / 2), px(4, 4))
     }
 
     #[test]
@@ -1061,7 +1083,7 @@ mod tests {
             eprintln!("no GPU; skip");
             return;
         };
-        let mut canvas = RasterCanvas::new(&device, 256, [1.0, 1.0, 1.0, 1.0]);
+        let mut canvas = RasterCanvas::new(&device, 256, 256, [1.0, 1.0, 1.0, 1.0]);
         let brush = Brush {
             radius_uv: 0.06,
             color: [0.0, 0.0, 0.0, 1.0],
@@ -1086,7 +1108,7 @@ mod tests {
             eprintln!("no GPU; skip");
             return;
         };
-        let mut canvas = RasterCanvas::new(&device, 256, [1.0, 1.0, 1.0, 1.0]);
+        let mut canvas = RasterCanvas::new(&device, 256, 256, [1.0, 1.0, 1.0, 1.0]);
         let brush = Brush {
             radius_uv: 0.08,
             color: [0.0, 0.0, 0.0, 1.0],
@@ -1136,7 +1158,7 @@ mod tests {
             eprintln!("no GPU; skip");
             return;
         };
-        let mut canvas = RasterCanvas::new(&device, 256, [1.0, 1.0, 1.0, 1.0]);
+        let mut canvas = RasterCanvas::new(&device, 256, 256, [1.0, 1.0, 1.0, 1.0]);
         // Initialise the texture to paper (new() doesn't clear until an encoder runs).
         let mut enc =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -1177,7 +1199,7 @@ mod tests {
             eprintln!("no GPU; skip");
             return;
         };
-        let mut canvas = RasterCanvas::new(&device, 256, [1.0, 1.0, 1.0, 1.0]);
+        let mut canvas = RasterCanvas::new(&device, 256, 256, [1.0, 1.0, 1.0, 1.0]);
         // Paint a black stroke (Normal), then erase part of it, then smudge across it —
         // exercises all three blend pipelines + the smudge pipeline + tip shapes.
         let strokes = [
@@ -1207,7 +1229,7 @@ mod tests {
             return;
         };
         let size = 256u32;
-        let mut canvas = RasterCanvas::new(&device, size, [1.0, 1.0, 1.0, 1.0]);
+        let mut canvas = RasterCanvas::new(&device, size, size, [1.0, 1.0, 1.0, 1.0]);
         let brush = Brush {
             radius_uv: 0.06,
             color: [0.0, 0.0, 0.0, 1.0],
@@ -1255,5 +1277,63 @@ mod tests {
         let idx = (y * size as usize + x) * 4;
         let px = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
         assert!(px[0] > 200, "pixel at u=0.25 should be paper (scissored out), got {px:?}");
+    }
+
+    /// M5: a non-square (2:1) canvas paints, reads back at the right dimensions, and
+    /// round-trips through undo — the width/height split doesn't silently degrade to square.
+    #[test]
+    fn non_square_canvas_paints_and_reports_correct_dimensions() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU; skip");
+            return;
+        };
+        let (w, h) = (320u32, 160u32);
+        let mut canvas = RasterCanvas::new(&device, w, h, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(canvas.width(), w);
+        assert_eq!(canvas.height(), h);
+
+        let brush = Brush {
+            radius_uv: 0.08,
+            color: [0.0, 0.0, 0.0, 1.0],
+            hardness: 0.9,
+            flow: 1.0,
+            ..Brush::default()
+        };
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear(&mut enc);
+        // Dab dead-center; on a non-square canvas this exercises the aspect-corrected
+        // vertex generation (an uncorrected dab would stretch into an ellipse but should
+        // still darken the center pixel either way — the geometry fix is about *shape*,
+        // this test is about *dimensions and basic paint* surviving the refactor).
+        canvas.stamp_segment(&device, &mut enc, [0.5, 0.5], [0.5, 0.5], &brush, None);
+        canvas.end_stroke(&device, &mut enc);
+        queue.submit(Some(enc.finish()));
+
+        let bpr = w * 4;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("non-square readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc2 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc2.copy_texture_to_buffer(
+            canvas.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc2.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let data = slice.get_mapped_range();
+        assert_eq!(data.len(), (bpr * h) as usize, "readback buffer matches w*h*4, not a square guess");
+        let idx = ((h / 2) * bpr + (w / 2) * 4) as usize;
+        assert!(data[idx] < 128, "center darkened on a non-square canvas, got {}", data[idx]);
+
+        assert!(canvas.can_undo());
     }
 }

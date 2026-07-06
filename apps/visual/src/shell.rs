@@ -101,8 +101,13 @@ pub struct ShellState {
     /// Live gradient guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
     /// before each frame so the overlay can draw the drag line.
     pub gradient_preview: Option<[f32; 4]>,
-    /// Set by the inspector flip/rotate buttons; drained in main.rs to call the renderer.
+    /// Set by the inspector flip/180° buttons; drained in main.rs to call the renderer.
+    /// Always dimension-preserving — safe regardless of canvas aspect ratio (M5).
     pub pending_layer_transform: Option<suite_gpu::LayerTransform>,
+    /// Set by the inspector's "Rotate Canvas" buttons; drained in main.rs. Rotates the
+    /// WHOLE document (every layer + the canvas dimensions swap) — a 90° rotation can't be
+    /// done per-layer once the canvas may be non-square (M5).
+    pub pending_canvas_rotate: Option<suite_gpu::CanvasRotate>,
 }
 
 impl Default for ShellState {
@@ -145,6 +150,7 @@ impl Default for ShellState {
             gradient_radial: false,
             gradient_preview: None,
             pending_layer_transform: None,
+            pending_canvas_rotate: None,
         }
     }
 }
@@ -732,8 +738,9 @@ pub fn draw_shell(
                 ui.add_space(12.0);
             }
 
-            // Layer transforms (M4): flip / rotate the active layer's pixels. Shown for the
-            // 2D paint-ish tools where a raster layer is the working surface.
+            // Layer transforms (M4): flip / 180°-rotate the active layer's pixels. Shown for
+            // the 2D paint-ish tools where a raster layer is the working surface. These three
+            // never change dimensions, so they're always safe regardless of canvas aspect (M5).
             if matches!(state.tool, Tool::Paint | Tool::Gradient | Tool::RectSelect | Tool::MagicWand) {
                 ui.separator();
                 ui.add_space(8.0);
@@ -746,20 +753,27 @@ pub fn draw_shell(
                     if ui.button(RichText::new("Flip V").color(TEXT_0)).clicked() {
                         state.pending_layer_transform = Some(suite_gpu::LayerTransform::FlipV);
                     }
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Rotate ⟳").color(TEXT_0)).clicked() {
-                        state.pending_layer_transform = Some(suite_gpu::LayerTransform::Rotate90Cw);
-                    }
-                    if ui.button(RichText::new("Rotate ⟲").color(TEXT_0)).clicked() {
-                        state.pending_layer_transform = Some(suite_gpu::LayerTransform::Rotate90Ccw);
-                    }
                     if ui.button(RichText::new("180°").color(TEXT_0)).clicked() {
                         state.pending_layer_transform = Some(suite_gpu::LayerTransform::Rotate180);
                     }
                 });
                 ui.add_space(4.0);
                 ui.label(RichText::new("Flips/rotates the active layer. ⌘Z undoes.").color(TEXT_2).small());
+                ui.add_space(8.0);
+                // A 90° rotation must rotate every layer + the canvas dimensions together to
+                // stay aligned, so it's a document-level op (M5), not per-layer like the above.
+                ui.label(RichText::new("Rotate Canvas").color(TEXT_0).strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Rotate ⟳").color(TEXT_0)).clicked() {
+                        state.pending_canvas_rotate = Some(suite_gpu::CanvasRotate::Cw);
+                    }
+                    if ui.button(RichText::new("Rotate ⟲").color(TEXT_0)).clicked() {
+                        state.pending_canvas_rotate = Some(suite_gpu::CanvasRotate::Ccw);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new("Rotates the whole document 90°. Not undoable.").color(TEXT_2).small());
                 ui.add_space(12.0);
             }
 
