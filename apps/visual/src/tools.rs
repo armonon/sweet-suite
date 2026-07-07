@@ -74,7 +74,7 @@ impl Tool {
             Self::AddLathe => "Adds a lathe/revolve mesh (vase profile) where you click. Shows as editable mesh.",
             Self::AddPipe => "Adds a path-extruded pipe (helix demo) where you click.",
             Self::Sculpt => "Drag to sculpt the selected mesh. Pick a brush in the inspector (Draw/Smooth/Flatten/Pinch). S to activate.",
-            Self::MagicWand => "Click on the paint canvas to flood-fill that region with the brush color. Tune tolerance in the inspector. W to activate.",
+            Self::MagicWand => "Click on the paint canvas to select the contiguous color region under the cursor. Tune tolerance in the inspector. Paint/Gradient/Move afterward respect the selection. W to activate.",
             Self::Eyedropper => "Click the canvas to pick that color into the brush (Eye button).",
         }
     }
@@ -806,10 +806,14 @@ pub fn handle_left_press(
             }
         }
         Tool::MagicWand => {
-            // Flood-fill the paint canvas region at the click point with the brush color.
+            // Quick Selection (Tier 1 retarget): flood-fill from the click point produces a
+            // reusable mask selection, not a direct paint — Paint/Gradient/Move afterward
+            // respect it exactly, same as an Ellipse/Lasso selection.
             if let Some((_, uv)) = paint_uv_under_cursor(doc, renderer, canvas, input.cursor) {
-                let fill = shell.brush.color; // [R, G, B, A] linear
-                renderer.paint_magic_wand_fill(uv, shell.magic_wand_tolerance, fill);
+                if let Some(shape) = renderer.magic_wand_select(uv, shell.magic_wand_tolerance) {
+                    input.select_rect = Some(suite_gpu::selection_shape_bounds(&shape));
+                    input.select_extra = Some(shape);
+                }
             }
         }
         Tool::Eyedropper => {
@@ -851,10 +855,12 @@ pub fn handle_left_release(input: &mut InputState) {
     // select_rect/select_extra.
     input.select_drag_start = None;
     input.ellipse_drag_start = None;
-    // Lasso: fewer than 3 points can't close into a real polygon — cancel it. A valid
-    // trace is already stored in select_extra (set live during the drag).
-    if input.lasso_points.len() < 3 {
-        if input.select_extra.is_some() {
+    // Lasso: fewer than 3 points can't close into a real polygon — cancel it. Check the
+    // shape itself (not `lasso_points.len()` as a side-channel proxy) — a bare point-count
+    // check would also fire for Ellipse/Mask selections, which never touch `lasso_points`
+    // and so would look identical to an aborted Lasso, wiping them out on every release.
+    if let Some(suite_gpu::SelectionShape::Polygon(points)) = &input.select_extra {
+        if points.len() < 3 {
             input.select_rect = None;
             input.select_extra = None;
         }

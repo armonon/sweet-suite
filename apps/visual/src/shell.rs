@@ -690,7 +690,7 @@ pub fn draw_shell(
                 ui.add_space(12.0);
             }
 
-            if matches!(state.tool, Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso) {
+            if matches!(state.tool, Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso | Tool::MagicWand) {
                 ui.separator();
                 ui.add_space(8.0);
                 ui.label(RichText::new("Selection").color(TEXT_0).strong());
@@ -698,6 +698,7 @@ pub fn draw_shell(
                 let shape_kind = match &state.selection_extra {
                     Some(suite_gpu::SelectionShape::Ellipse { .. }) => "Ellipse",
                     Some(suite_gpu::SelectionShape::Polygon(_)) => "Lasso",
+                    Some(suite_gpu::SelectionShape::Mask { .. }) => "Quick Select",
                     None => "Rect",
                 };
                 match state.selection_rect {
@@ -749,7 +750,12 @@ pub fn draw_shell(
                 };
                 ui.label(RichText::new(crop_hint).color(TEXT_2).small());
                 ui.add_space(8.0);
-                ui.label(RichText::new("Gradient/Move respect the exact shape (Ellipse/Lasso); Paint is still bounded by the rect for now.").color(TEXT_2).small());
+                let shape_hint = if matches!(&state.selection_extra, Some(suite_gpu::SelectionShape::Mask { .. })) {
+                    "Paint/Gradient/Move respect the exact flood-filled region. The marching-ants outline here shows its bounding box, not the exact shape (a precise outline trace for Quick Select is a tracked follow-up)."
+                } else {
+                    "Paint/Gradient/Move all respect the exact shape (Ellipse/Lasso), not just the bounding box."
+                };
+                ui.label(RichText::new(shape_hint).color(TEXT_2).small());
                 ui.add_space(12.0);
             }
 
@@ -859,7 +865,7 @@ pub fn draw_shell(
                 });
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("Click on a paint canvas to flood-fill that color region with the brush color.")
+                    RichText::new("Click on the canvas to select the contiguous color region under the cursor (samples the flattened composite). Produces a selection, same as Ellipse/Lasso — use Paint/Gradient/Move afterward to actually affect it.")
                         .color(TEXT_2)
                         .small(),
                 );

@@ -219,6 +219,13 @@ pub enum SelectionShape {
     /// A closed polygon (implicitly closed — the last point connects back to the first).
     /// UV-space vertices, in drag order.
     Polygon(Vec<[f32; 2]>),
+    /// A raw per-texel coverage mask (row-major, 0 = unselected, 255 = selected) captured at
+    /// `width`×`height` — produced by Magic Wand's flood fill, which (unlike Ellipse/Lasso)
+    /// has no compact analytic or vertex representation. Unlike the other two variants this
+    /// one is resolution-coupled, not UV-resolution-independent: `rasterize_selection_mask`
+    /// resamples it (nearest-neighbor) if asked for a different size than it was captured at,
+    /// which only happens if the canvas is resized (Crop/rotate) after the wand selection.
+    Mask { width: u32, height: u32, data: Vec<u8> },
 }
 
 /// **Pure**: rasterize a `SelectionShape` into a full-canvas mask (row-major, one byte per
@@ -275,6 +282,21 @@ pub fn rasterize_selection_mask(width: usize, height: usize, shape: &SelectionSh
                 }
             }
         }
+        SelectionShape::Mask { width: mw, height: mh, data } => {
+            if *mw as usize == width && *mh as usize == height {
+                return data.clone();
+            }
+            // Resolution mismatch (canvas resized since the wand selection was made):
+            // nearest-neighbor resample rather than dropping the selection outright.
+            let (mw, mh) = (*mw as usize, (*mh).max(1) as usize);
+            for y in 0..height {
+                let sy = (y * mh / height.max(1)).min(mh.saturating_sub(1));
+                for x in 0..width {
+                    let sx = (x * mw / width.max(1)).min(mw.saturating_sub(1));
+                    mask[y * width + x] = data[sy * mw + sx];
+                }
+            }
+        }
     }
     mask
 }
@@ -295,6 +317,26 @@ pub fn selection_shape_bounds(shape: &SelectionShape) -> [f32; 4] {
                 y1 = y1.max(p[1]);
             }
             [x0.max(0.0), y0.max(0.0), x1.min(1.0), y1.min(1.0)]
+        }
+        SelectionShape::Mask { width, height, data } => {
+            let (w, h) = (*width as usize, *height as usize);
+            let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0usize, 0usize);
+            let mut any = false;
+            for y in 0..h {
+                for x in 0..w {
+                    if data[y * w + x] > 0 {
+                        any = true;
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x + 1);
+                        y1 = y1.max(y + 1);
+                    }
+                }
+            }
+            if !any {
+                return [0.0, 0.0, 0.0, 0.0];
+            }
+            [x0 as f32 / w as f32, y0 as f32 / h as f32, x1 as f32 / w as f32, y1 as f32 / h as f32]
         }
     }
 }
@@ -449,6 +491,58 @@ pub fn crop_pixels(src: &[u8], src_width: usize, src_height: usize, x0: usize, y
             .copy_from_slice(&src[src_row_start..src_row_start + crop_w * 4]);
     }
     dst
+}
+
+/// **Pure** BFS flood fill over an RGBA8 buffer: starting at the texel under `seed_uv`,
+/// grows to every 4-connected neighbor within `tolerance` (0–1, per channel including alpha)
+/// of the seed's color. Returns a coverage mask (row-major, 0/255) plus the selected texel
+/// count (0 if `seed_uv` is degenerate, though the seed always matches itself in practice) —
+/// used by `Renderer::magic_wand_select` (Tier 1 Quick Selection) after a GPU readback.
+pub fn flood_fill_mask(pixels: &[u8], width: usize, height: usize, seed_uv: [f32; 2], tolerance: f32) -> (Vec<u8>, usize) {
+    let px = (seed_uv[0].clamp(0.0, 0.9999) * width as f32) as usize;
+    let py = (seed_uv[1].clamp(0.0, 0.9999) * height as f32) as usize;
+    let seed_idx = (py * width + px) * 4;
+
+    let (seed_r, seed_g, seed_b, seed_a) = (
+        pixels[seed_idx] as f32 / 255.0,
+        pixels[seed_idx + 1] as f32 / 255.0,
+        pixels[seed_idx + 2] as f32 / 255.0,
+        pixels[seed_idx + 3] as f32 / 255.0,
+    );
+
+    let mut mask = vec![0u8; width * height];
+    let mut visited = vec![false; width * height];
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((px as isize, py as isize));
+    let mut count = 0usize;
+
+    while let Some((x, y)) = queue.pop_front() {
+        if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
+            continue;
+        }
+        let (xi, yi) = (x as usize, y as usize);
+        let flat = yi * width + xi;
+        if visited[flat] {
+            continue;
+        }
+        let idx = flat * 4;
+        let matches = (pixels[idx] as f32 / 255.0 - seed_r).abs() <= tolerance
+            && (pixels[idx + 1] as f32 / 255.0 - seed_g).abs() <= tolerance
+            && (pixels[idx + 2] as f32 / 255.0 - seed_b).abs() <= tolerance
+            && (pixels[idx + 3] as f32 / 255.0 - seed_a).abs() <= tolerance;
+        if !matches {
+            continue;
+        }
+        visited[flat] = true;
+        mask[flat] = 255;
+        count += 1;
+        queue.push_back((x - 1, y));
+        queue.push_back((x + 1, y));
+        queue.push_back((x, y - 1));
+        queue.push_back((x, y + 1));
+    }
+
+    (mask, count)
 }
 
 /// **Pure** whole-layer shift by `(dx, dy)` texels. Texels that would land off-canvas are
@@ -2102,6 +2196,26 @@ impl Renderer {
                         p[1] += udy;
                     }
                 }
+                SelectionShape::Mask { width: mw, height: mh, data } => {
+                    // A raw mask has no vertices to offset — shift its pixel data instead
+                    // (same one-channel logic as `shift_pixels`, just 1 byte/texel).
+                    let (mw, mh) = (*mw as usize, *mh as usize);
+                    let mut shifted = vec![0u8; data.len()];
+                    for sy in 0..mh {
+                        let ny = sy as i32 + dy;
+                        if ny < 0 || ny >= mh as i32 {
+                            continue;
+                        }
+                        for sx in 0..mw {
+                            let nx = sx as i32 + dx;
+                            if nx < 0 || nx >= mw as i32 {
+                                continue;
+                            }
+                            shifted[ny as usize * mw + nx as usize] = data[sy * mw + sx];
+                        }
+                    }
+                    *data = shifted;
+                }
             }
         }
         new_selection_uv
@@ -2159,77 +2273,23 @@ impl Renderer {
         self.layers_dirty = true;
     }
 
-    /// **Magic wand**: flood-fill from `seed_uv` on the paint canvas, selecting pixels
-    /// within `tolerance` (0–1 per channel) of the seed color. Fills the selection with
-    /// `fill_color` (RGBA linear, pre-multiplied alpha) and re-uploads the result.
-    ///
-    /// Returns the pixel count of the filled region (0 if seed lands outside a painted area).
-    ///
-    /// *Upgrade path:* replace the flood-fill heuristic with SAM (Segment Anything Model)
-    /// via the `ort` ONNX runtime once a model download can be authorized.
-    pub fn paint_magic_wand_fill(&mut self, seed_uv: [f32; 2], tolerance: f32, fill_color: [f32; 4]) -> usize {
+    /// **Magic wand → selection** (Tier 1 Quick Selection): flood-fill from `seed_uv` over
+    /// the flattened composite (so it can select across what's visible, not just the active
+    /// layer — same sampling source as `paint_readback_rgba`, used by Export/save). Returns
+    /// the region as a `SelectionShape::Mask` rather than painting it directly: the caller
+    /// assigns it to `selection_extra`, so any subsequent Paint/Gradient/Move (Tier 1's mask
+    /// machinery) respects the exact flood-filled shape, same as an Ellipse/Lasso selection —
+    /// Magic Wand used to flood-fill pixels immediately and irreversibly outside undo's
+    /// per-stroke granularity; as a selection it composes with every other tool instead.
+    /// Thin GPU-readback wrapper around the pure `flood_fill_mask` (see there for the BFS).
+    pub fn magic_wand_select(&mut self, seed_uv: [f32; 2], tolerance: f32) -> Option<SelectionShape> {
         let (width, height) = (self.raster.width() as usize, self.raster.height() as usize);
-        let mut pixels = self.paint_readback_rgba();
-
-        let px = (seed_uv[0].clamp(0.0, 0.9999) * width as f32) as usize;
-        let py = (seed_uv[1].clamp(0.0, 0.9999) * height as f32) as usize;
-        let seed_idx = (py * width + px) * 4;
-
-        // Copy seed color into scalars to avoid borrowing pixels in the BFS loop.
-        let (seed_r, seed_g, seed_b, seed_a) = (
-            pixels[seed_idx] as f32 / 255.0,
-            pixels[seed_idx + 1] as f32 / 255.0,
-            pixels[seed_idx + 2] as f32 / 255.0,
-            pixels[seed_idx + 3] as f32 / 255.0,
-        );
-
-        let fill_r = (fill_color[0].clamp(0.0, 1.0) * 255.0) as u8;
-        let fill_g = (fill_color[1].clamp(0.0, 1.0) * 255.0) as u8;
-        let fill_b = (fill_color[2].clamp(0.0, 1.0) * 255.0) as u8;
-        let fill_a = (fill_color[3].clamp(0.0, 1.0) * 255.0) as u8;
-
-        // BFS flood fill.
-        let mut visited = vec![false; width * height];
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back((px as isize, py as isize));
-        let mut count = 0usize;
-
-        while let Some((x, y)) = queue.pop_front() {
-            if x < 0 || y < 0 || x >= width as isize || y >= height as isize {
-                continue;
-            }
-            let xi = x as usize;
-            let yi = y as usize;
-            let flat = yi * width + xi;
-            if visited[flat] {
-                continue;
-            }
-            let idx = flat * 4;
-            // Check color similarity without a closure (avoids immutable borrow conflict).
-            let matches = (pixels[idx] as f32 / 255.0 - seed_r).abs() <= tolerance
-                && (pixels[idx + 1] as f32 / 255.0 - seed_g).abs() <= tolerance
-                && (pixels[idx + 2] as f32 / 255.0 - seed_b).abs() <= tolerance
-                && (pixels[idx + 3] as f32 / 255.0 - seed_a).abs() <= tolerance;
-            if !matches {
-                continue;
-            }
-            visited[flat] = true;
-            pixels[idx] = fill_r;
-            pixels[idx + 1] = fill_g;
-            pixels[idx + 2] = fill_b;
-            pixels[idx + 3] = fill_a;
-            count += 1;
-            queue.push_back((x - 1, y));
-            queue.push_back((x + 1, y));
-            queue.push_back((x, y - 1));
-            queue.push_back((x, y + 1));
+        let pixels = self.paint_readback_rgba();
+        let (mask, count) = flood_fill_mask(&pixels, width, height, seed_uv, tolerance);
+        if count == 0 {
+            return None;
         }
-
-        if count > 0 {
-            self.layers[self.active_layer].canvas.upload_rgba(&self.queue, &pixels);
-            self.layers_dirty = true;
-        }
-        count
+        Some(SelectionShape::Mask { width: width as u32, height: height as u32, data: mask })
     }
 
     // ----- M4: core 2D ops (gradient fill, layer transforms) ---------------------------
@@ -3267,7 +3327,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
+    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -3454,6 +3514,24 @@ mod m4_tests {
     }
 
     #[test]
+    fn rasterize_selection_mask_mask_variant_passes_through_at_matching_size_and_resamples_otherwise() {
+        let (w, h) = (4, 4);
+        let mut data = vec![0u8; w * h];
+        data[0] = 255; // top-left texel only
+        let shape = SelectionShape::Mask { width: w as u32, height: h as u32, data: data.clone() };
+
+        // Same size: identity pass-through.
+        let out = rasterize_selection_mask(w, h, &shape);
+        assert_eq!(out, data);
+
+        // Double size: nearest-neighbor resample should still mark (roughly) the top-left
+        // quadrant, not the whole canvas and not nothing.
+        let out2 = rasterize_selection_mask(w * 2, h * 2, &shape);
+        assert_eq!(out2[0], 255, "top-left corner should still be selected after upscaling");
+        assert_eq!(out2[(h * 2 - 1) * (w * 2) + (w * 2 - 1)], 0, "bottom-right corner should stay unselected");
+    }
+
+    #[test]
     fn selection_shape_bounds_computes_the_right_bbox() {
         let ellipse = SelectionShape::Ellipse { cx: 0.5, cy: 0.4, rx: 0.2, ry: 0.1 };
         let b = selection_shape_bounds(&ellipse);
@@ -3464,6 +3542,75 @@ mod m4_tests {
         let b = selection_shape_bounds(&poly);
         assert!((b[0] - 0.1).abs() < 1e-5 && (b[2] - 0.8).abs() < 1e-5);
         assert!((b[1] - 0.2).abs() < 1e-5 && (b[3] - 0.9).abs() < 1e-5);
+
+        // Mask: bbox is the tight extent of the nonzero texels, not the whole canvas.
+        let (w, h) = (10, 10);
+        let mut data = vec![0u8; w * h];
+        for y in 3..6 {
+            for x in 2..5 {
+                data[y * w + x] = 255;
+            }
+        }
+        let mask = SelectionShape::Mask { width: w as u32, height: h as u32, data };
+        let b = selection_shape_bounds(&mask);
+        assert!((b[0] - 0.2).abs() < 1e-5 && (b[2] - 0.5).abs() < 1e-5, "x bounds: {b:?}");
+        assert!((b[1] - 0.3).abs() < 1e-5 && (b[3] - 0.6).abs() < 1e-5, "y bounds: {b:?}");
+    }
+
+    #[test]
+    fn flood_fill_mask_selects_the_matching_region_and_stops_at_the_boundary() {
+        // A 10x10 buffer: left half red, right half blue (hard edge at x=5). Flood fill from
+        // the red side should select exactly the left half, nothing on the blue side.
+        let (w, h) = (10, 10);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+                if x < 5 {
+                    buf[idx..idx + 4].copy_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    buf[idx..idx + 4].copy_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+        }
+        let (mask, count) = flood_fill_mask(&buf, w, h, [0.1, 0.5], 0.1);
+        assert_eq!(count, 5 * 10, "should select exactly the left half");
+        for y in 0..h {
+            for x in 0..w {
+                let expect = if x < 5 { 255 } else { 0 };
+                assert_eq!(mask[y * w + x], expect, "mismatch at ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn flood_fill_mask_does_not_leak_through_a_diagonal_gap() {
+        // 4-connectivity: two red regions touching only at a corner (diagonal) must NOT be
+        // treated as connected — this is what distinguishes flood fill from a plain
+        // color-threshold mask.
+        let (w, h) = (4, 4);
+        let mut buf = vec![0u8; w * h * 4];
+        for p in buf.chunks_mut(4) {
+            p.copy_from_slice(&[0, 255, 0, 255]); // all green
+        }
+        // Carve out everything except two diagonal corners so only (0,0) and (3,3) are red,
+        // and they only "touch" diagonally through (1,1)/(2,2) which stay green.
+        let set = |buf: &mut [u8], x: usize, y: usize, c: [u8; 4]| {
+            let idx = (y * w + x) * 4;
+            buf[idx..idx + 4].copy_from_slice(&c);
+        };
+        set(&mut buf, 0, 0, [255, 0, 0, 255]);
+        set(&mut buf, 1, 1, [255, 0, 0, 255]);
+        set(&mut buf, 2, 2, [0, 255, 0, 255]);
+        set(&mut buf, 3, 3, [255, 0, 0, 255]);
+        let (mask, count) = flood_fill_mask(&buf, w, h, [0.0, 0.0], 0.1);
+        // Starting at (0,0): 4-connected reach includes (1,1) only via a shared edge with a
+        // matching neighbor, but (1,1) only touches (0,0) diagonally — so it must NOT be
+        // selected, and neither must the far corner (3,3).
+        assert_eq!(count, 1, "only the seed pixel should match: {mask:?}");
+        assert_eq!(mask[0], 255);
+        assert_eq!(mask[1 * w + 1], 0, "diagonal neighbor must not leak into the selection");
+        assert_eq!(mask[3 * w + 3], 0);
     }
 
     #[test]

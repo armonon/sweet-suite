@@ -38,7 +38,8 @@ The current rectangle-only selection + no masks is the biggest _depth_ gap on th
 |---|---|---|---|---|
 | S1 | ~~**Selection mask texture**~~ **DONE (core) 2026-07-06** | Unlocks everything below. | M | Shipped: `SelectionShape{Ellipse,Polygon}` + `rasterize_selection_mask` (on-demand CPU mask, not a standing per-frame buffer). Gradient + Move consult it for exact-shape correctness; the rect bound still drives the GPU scissor/Crop, unchanged. **Not yet masked: brush painting** inside a non-rect selection (still bounded by the bbox scissor only) — see S1b below. |
 | S1b | ~~**Masked brush painting**~~ **DONE 2026-07-07** | Paint should respect the exact Ellipse/Lasso shape, not just its bounding box. | M | Shipped: `RasterCanvas::end_stroke_masked` — a stroke-end CPU blend against `pre_stroke` using the mask, not a shared-pipeline shader change. Caught a real wgpu `COPY_BYTES_PER_ROW_ALIGNMENT` bug via the GPU-backed test before it shipped (arbitrary stroke-region readback essentially never hits the 256-byte row alignment `copy_texture_to_buffer` requires). See DECISIONS.md. |
-| S2 | ~~**Ellipse + Lasso selection**~~ **DONE 2026-07-06** | Real selection toolkit. | M | Shipped: `Tool::EllipseSelect` ("Elps") and `Tool::Lasso` ("Lso", hotkey **L**), both on the S1 mask infrastructure. Marching-ants generalized to trace the exact shape (ellipse as an N-gon, lasso as its own point path), not just a rect. **Still open:** Quick Selection / retargeting Magic Wand to produce a mask-based selection instead of directly flood-filling; feather (blur the mask edge). |
+| S2 | ~~**Ellipse + Lasso selection**~~ **DONE 2026-07-06** | Real selection toolkit. | M | Shipped: `Tool::EllipseSelect` ("Elps") and `Tool::Lasso` ("Lso", hotkey **L**), both on the S1 mask infrastructure. Marching-ants generalized to trace the exact shape (ellipse as an N-gon, lasso as its own point path), not just a rect. |
+| S2b | ~~**Quick Selection retargeting**~~ **DONE 2026-07-07** | Magic Wand should produce a reusable selection, not paint directly. | S | Shipped: `SelectionShape::Mask{width,height,data}` — a raw per-texel coverage mask, for the one shape (flood-fill) with no compact vertex/analytic form. `Renderer::magic_wand_select` (was `paint_magic_wand_fill`) returns it instead of mutating pixels; `rasterize_selection_mask`/`selection_shape_bounds`/Move all gained a `Mask` arm. Flood-fill BFS extracted into a pure `flood_fill_mask` fn (CPU-testable, no GPU device needed) per the project's existing pure-fn-for-pixel-math discipline. **Caught pre-ship:** `handle_left_release`'s Lasso-cancel check used `lasso_points.len() < 3` as a proxy for "was this a Lasso drag" — true for every non-Lasso selection tool, so it silently cancelled every Ellipse (and would have cancelled every new Mask) selection right after mouse-up. Fixed by checking the shape variant itself instead of the side-channel counter. **Still open:** marching-ants for a Mask selection draws its bounding box, not the exact flood-filled outline (documented in the inspector, not silently wrong); feather (blur the mask edge). |
 | S3 | **Layer masks** | The core of non-destructive editing. | M | Reuse the S1 mask machinery per layer. |
 
 ## Tier 2 — 3D interop & material credibility
@@ -96,8 +97,8 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 | Rectangular Marquee | ✅ `RectSelect` (M3) | — |
 | Elliptical Marquee | ✅ `Tool::EllipseSelect` (S1/S2, 2026-07-06) — Row/Column variants still ⬜ (niche) | — |
 | Lasso | ✅ `Tool::Lasso` (S2, 2026-07-06) — Polygonal/Magnetic variants still ⬜ | — |
-| Quick Selection | ⬜ — retargeting Magic Wand to produce a mask instead of directly flood-filling | Tier 1 (tracked, small now that S1 exists) |
-| Magic Wand | 🟡 have — but it directly flood-fills, doesn't produce a reusable selection like Photoshop's | Tier 1 (S2) retargets it |
+| Quick Selection | ✅ `SelectionShape::Mask` (S2b, 2026-07-07) — Magic Wand produces it; bbox-only marching-ants for now, exact outline trace not done | — |
+| Magic Wand | ✅ `Renderer::magic_wand_select` (S2b, 2026-07-07) — now produces a reusable mask selection instead of flood-filling pixels directly | — |
 | Crop | ✅ `crop_to_rect` (M4b) | — |
 | Perspective Crop / Slice / Frame | ⬜ niche | Not scheduled |
 | Eyedropper | ✅ | — |
@@ -110,9 +111,9 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 | Clone Stamp / Pattern Stamp | ⬜ | Medium — next highest-value gap after Move |
 | History Brush / Art History Brush | ⬜ — needs "paint from a prior undo state" | Large (new architecture) |
 | Eraser | ✅ `BrushBlend::Erase` | — |
-| Background Eraser / Magic Eraser | 🟡 partial overlap with Magic Wand→transparent | Small once S2 lands |
+| Background Eraser / Magic Eraser | 🟡 achievable today: Magic Wand → select, then Erase-blend Paint over the selection | Small: a one-click "erase selection" action |
 | Gradient | ✅ (M4) | — |
-| Paint Bucket | 🟡 Magic Wand's flood-fill covers this | Small: flat-fill-selection variant |
+| Paint Bucket | 🟡 achievable today: Magic Wand → select, then Paint fills it (S1b masking) | Small: a one-click "fill selection" action |
 | Blur / Sharpen / Smudge (drag brush) | 🟡 Smudge ✅ (brush param); Blur/Sharpen exist only as full-image adjustment filters, not a localized drag brush | Medium |
 | Dodge / Burn / Sponge | ⬜ — brush-based tonal ops | Medium |
 | Pen / Freeform / Curvature / anchor points | ⬜ — no vector-path architecture at all | Large, own future tier |
@@ -127,7 +128,8 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 **Bottom line:** SWEET covers the core paint/select/gradient/eyedropper/crop path solidly,
 but is missing entire tool *families* — healing/clone/history-brush, dodge/burn/sponge,
 mixer brush, pen/vector shapes, content-aware fill — each of which is its own real
-project, not a quick add. The single highest-leverage next step is **Tier 1's selection
-mask** (S1): it's the one piece of infrastructure that unlocks Elliptical Marquee, Lasso,
-Polygonal Lasso, Quick Selection, Quick Mask, and layer masks all at once, rather than
-being one more one-off tool.
+project, not a quick add. **Tier 1's selection mask** (S1) paid off exactly as scoped: it
+was the one piece of infrastructure that unlocked Elliptical Marquee, Lasso, masked brush
+painting, and Quick Selection (S1/S1b/S2/S2b, all shipped) rather than each being a
+one-off tool. What's left on that thread is layer masks (S3) and Quick Mask mode — both
+direct reuses of the same mask machinery, not new infrastructure.
