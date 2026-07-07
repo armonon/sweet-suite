@@ -647,6 +647,131 @@ impl RasterCanvas {
         self.redo.clear();
     }
 
+    /// Blocking readback of just `bbox` from `tex` (not the whole canvas) — a per-stroke
+    /// cost (mouse-up), not a per-dab one, so it doesn't violate the "no readback in the
+    /// live paint path" rule the rest of this module follows.
+    fn readback_bbox(&self, device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, bbox: Bbox) -> Vec<u8> {
+        let (w, h) = (bbox.w(), bbox.h());
+        // `copy_texture_to_buffer` requires bytes_per_row to be a multiple of
+        // COPY_BYTES_PER_ROW_ALIGNMENT (256) — unlike `write_texture`, which has no such
+        // constraint. An arbitrary stroke's dirty-region width essentially never satisfies
+        // this on its own (that needs a 64-texel-aligned width), so the buffer is allocated
+        // padded and each row is stripped back to a tightly-packed `w*4` on the way out.
+        let unpadded_bpr = w * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bpr = unpadded_bpr.div_ceil(align) * align;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raster region readback"),
+            size: (padded_bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: bbox.x0, y: bbox.y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded_bpr), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let mut packed = Vec::with_capacity((unpadded_bpr * h) as usize);
+        for row in 0..h as usize {
+            let start = row * padded_bpr as usize;
+            packed.extend_from_slice(&data[start..start + unpadded_bpr as usize]);
+        }
+        packed
+    }
+
+    /// **Tier 1 (S1b)**: like `end_stroke`, but blends the stroke's dirty region against the
+    /// pre-stroke snapshot using `mask` (a full-canvas, one-byte-per-texel selection mask —
+    /// 0 = revert to pre-stroke/unpainted, 255 = keep the new paint, in between = blend)
+    /// before recording undo history. Used when an exact-shape selection (Ellipse/Lasso) is
+    /// active — the GPU scissor already constrains dabs to the selection's bounding box, but
+    /// can't express a curved/irregular shape; this corrects the final pixels regardless of
+    /// how many overlapping dabs the stroke laid down. `mask_width` is the mask's row stride
+    /// (the canvas width).
+    ///
+    /// The blend approximates "each dab was masked before compositing" by instead blending
+    /// the stroke's *net* pre→post change — visually equivalent for a typical single-pass
+    /// stroke, but not bit-identical to true per-dab masking for a stroke that paints back
+    /// over the same pixels multiple times with a non-Normal blend mode. A known, documented
+    /// simplification, not a silent approximation.
+    pub fn end_stroke_masked(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        mask: &[u8],
+        mask_width: usize,
+    ) {
+        if !self.stroke_active {
+            return;
+        }
+        self.stroke_active = false;
+        let Some(bbox) = self.dirty.take() else {
+            return;
+        };
+        if bbox.w() == 0 || bbox.h() == 0 {
+            return;
+        }
+
+        let post = self.readback_bbox(device, queue, &self.texture, bbox);
+        let pre = self.readback_bbox(device, queue, &self.pre_stroke, bbox);
+        let (bw, bh) = (bbox.w() as usize, bbox.h() as usize);
+        let mut blended = vec![0u8; post.len()];
+        for y in 0..bh {
+            for x in 0..bw {
+                let i = (y * bw + x) * 4;
+                let mask_x = bbox.x0 as usize + x;
+                let mask_y = bbox.y0 as usize + y;
+                let m = mask[mask_y * mask_width + mask_x] as f32 / 255.0;
+                for c in 0..3 {
+                    // RGB is sRGB-encoded; blend in linear space for correctness.
+                    let p = crate::srgb_to_linear(pre[i + c] as f32 / 255.0);
+                    let q = crate::srgb_to_linear(post[i + c] as f32 / 255.0);
+                    let v = p + (q - p) * m;
+                    blended[i + c] = (crate::linear_to_srgb(v).clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+                // Alpha isn't gamma-encoded — lerp its raw byte value directly.
+                let pa = pre[i + 3] as f32;
+                let qa = post[i + 3] as f32;
+                blended[i + 3] = (pa + (qa - pa) * m).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: bbox.x0, y: bbox.y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &blended,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bbox.w() * 4), rows_per_image: Some(bbox.h()) },
+            wgpu::Extent3d { width: bbox.w(), height: bbox.h(), depth_or_array_layers: 1 },
+        );
+
+        // Normal undo-history capture (same as end_stroke) — always from pre_stroke, so this
+        // is unaffected by (and correctly ordered after) the write_texture call above: wgpu
+        // flushes queue writes before any later submit's command buffers run.
+        let region = self.make_region_from(device, encoder, &self.pre_stroke_clone_handle(), bbox);
+        self.undo.push(region);
+        if self.undo.len() > self.max_history {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
     /// Undo the last stroke/clear. Returns true if anything was undone.
     pub fn undo(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) -> bool {
         let Some(entry) = self.undo.pop() else {
@@ -1277,6 +1402,82 @@ mod tests {
         let idx = (y * size as usize + x) * 4;
         let px = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
         assert!(px[0] > 200, "pixel at u=0.25 should be paper (scissored out), got {px:?}");
+    }
+
+    /// Tier 1 (S1b): `end_stroke_masked` corrects a stroke to an exact-shape selection that
+    /// the GPU scissor (a coarse bounding box) couldn't express on its own. A stroke that
+    /// covers the WHOLE canvas (as if the scissor were the full bounding rect) should end up
+    /// only actually painted where the mask says so — the left half here, right half reverts
+    /// to paper even though the live GPU dabs touched it.
+    #[test]
+    fn end_stroke_masked_reverts_pixels_outside_the_mask() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no GPU; skip");
+            return;
+        };
+        // 64 texels wide: bytes-per-row (64*4=256) is already COPY_BYTES_PER_ROW_ALIGNMENT-
+        // aligned, so this test's own verification readback below doesn't need padding logic
+        // (readback_bbox, the code under test, handles arbitrary/unaligned widths itself).
+        let size = 64u32;
+        let mut canvas = RasterCanvas::new(&device, size, size, [1.0, 1.0, 1.0, 1.0]);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear(&mut enc);
+        queue.submit(Some(enc.finish()));
+
+        // A mask that's fully selected on the left half, fully unselected on the right.
+        let mut mask = vec![0u8; (size * size) as usize];
+        for y in 0..size as usize {
+            for x in 0..(size as usize / 2) {
+                mask[y * size as usize + x] = 255;
+            }
+        }
+
+        let brush = Brush {
+            radius_uv: 0.5, // deliberately huge — covers the whole canvas, unconstrained
+            color: [0.0, 0.0, 0.0, 1.0],
+            hardness: 1.0,
+            flow: 1.0,
+            ..Brush::default()
+        };
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.clear(&mut enc); // re-clear so this is the only stroke in history
+        canvas.stamp_segment(&device, &mut enc, [0.5, 0.5], [0.5, 0.5], &brush, None);
+        queue.submit(Some(enc.finish()));
+
+        let mut enc2 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        canvas.end_stroke_masked(&device, &queue, &mut enc2, &mask, size as usize);
+        queue.submit(Some(enc2.finish()));
+
+        let bpr = size * 4;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("masked stroke readback"),
+            size: (bpr * size) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc3 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc3.copy_texture_to_buffer(
+            canvas.texture().as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(size) },
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc3.finish()));
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.expect("map"));
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        let data = slice.get_mapped_range();
+        let px = |x: u32, y: u32| {
+            let i = ((y * size + x) * 4) as usize;
+            [data[i], data[i + 1], data[i + 2], data[i + 3]]
+        };
+        // Left half (masked in): the stroke's black paint survives.
+        assert!(px(16, 32)[0] < 60, "left half (mask=255) should be painted black, got {:?}", px(16, 32));
+        // Right half (masked out): reverted to paper, even though the live GPU dab painted
+        // there too — this is exactly what the coarse scissor rect couldn't have prevented.
+        assert!(px(48, 32)[0] > 220, "right half (mask=0) should revert to paper, got {:?}", px(48, 32));
     }
 
     /// M5: a non-square (2:1) canvas paints, reads back at the right dimensions, and

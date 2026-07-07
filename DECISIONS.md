@@ -1382,3 +1382,25 @@ The Lasso cursor-move handler initially only appended to `lasso_points` and set 
 Screen Recording access flickered available again mid-session (`request_access` succeeded with no "another session" error) but the actual capture still returned the same byte-identical black frame as every prior attempt this session — confirms the block is at the OS capture layer, not the session-lock layer I'd been assuming. Relied on the automated suite once more; the geometric-correctness tests above (independent radii, mask-vs-bbox, shape tracking) are deliberately the closest a unit test can get to "did this actually draw right" without eyes on the screen.
 
 Next: masked brush painting (S1b) or Quick Selection retargeting, then M4's remaining items (text tool, free transform), then layer masks (S3).
+
+---
+
+## Tier 1 S1b: masked brush painting — 2026-07-07
+
+Armon: "do all" — closed the gap flagged at the end of the previous entry rather than move on with it outstanding.
+
+### Approach chosen, and why the alternative was rejected
+Two ways to make Paint respect an exact Ellipse/Lasso shape: (a) a mask-sampling brush fragment shader, which means adding a bind group to `RasterCanvas`'s brush pipelines — currently `bind_group_layouts: &[]`, i.e. every brush stroke in the app, square-canvas or not, selection or not, runs through this pipeline; or (b) a stroke-end CPU blend against the `pre_stroke` snapshot the canvas already captures for undo. Went with (b): it's additive (a new method, `end_stroke_masked`, sitting next to the existing `end_stroke` — nothing about plain painting changes) rather than a modification to code every stroke depends on.
+
+### What shipped
+- **`RasterCanvas::end_stroke_masked(device, queue, encoder, mask, mask_width)`**: on stroke end, reads back just the dirty bounding-box region (not the whole canvas) from both the live texture (post-stroke) and `pre_stroke` (pre-stroke, already captured), blends the two per-pixel by the mask's coverage — in **linear** space for RGB (the texture is sRGB-encoded), a direct lerp for alpha (not gamma-encoded) — writes the blended region back via a targeted `queue.write_texture`, then runs the normal undo-history capture unchanged.
+- **`Renderer::paint_end_stroke`** branches on `self.selection_extra`: `Some(shape)` rasterizes the mask on demand and calls `end_stroke_masked`; `None` (the common case — no selection, or a plain RectSelect) calls the original `end_stroke`, byte-for-byte unchanged code path.
+- **Documented, not hidden, approximation**: the blend is "stroke net pre→post change," not "each dab masked individually before compositing." For a typical single-pass stroke these are visually identical; they could diverge for a stroke that paints back over the same pixels multiple times with a non-Normal blend mode. Written into the method's doc comment, not left implicit.
+
+### Bug caught by the test, before it shipped
+`copy_texture_to_buffer` (used for the dirty-region readback) requires `bytes_per_row` to be a multiple of `COPY_BYTES_PER_ROW_ALIGNMENT` (256) — a real wgpu/GPU constraint. The codebase's existing full-canvas readbacks satisfy this by accident (canvas sizes like 256, 1536 happen to be 64-texel-aligned); an arbitrary stroke's dirty-region **width** essentially never is. Wrote the test with a real GPU device (not just a CPU pure-function test) specifically because this was a genuinely new code path — the wgpu validation error fired on the very first run. Fixed by padding the readback buffer's row stride to the alignment and stripping the padding back out per row on the way out; confirmed `write_texture` (the write side) has no equivalent constraint by checking the existing full-canvas `write_texture_rgba` already writes arbitrary widths successfully (M5's non-square canvases). This is exactly the class of bug the CPU-only pure-function tests (crop/rotate/gradient/move) can't catch — worth the extra weight of a headless-GPU test for genuinely new GPU-touching code, not just for the pixel math.
+
+### Testing
+1 new GPU-backed test: a stroke painted across a mask boundary correctly keeps the masked-in half and reverts the masked-out half to paper, even though the live GPU dabs touched both sides (only the coarse bounding-box scissor constrained painting during the drag). 84 workspace tests green.
+
+Next: Quick Selection retargeting (Magic Wand → produces a mask, not a direct fill) or M4's remaining items (text tool, free transform), then layer masks (S3).

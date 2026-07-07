@@ -1498,7 +1498,24 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("paint end stroke enc"),
             });
-        self.layers[self.active_layer].canvas.end_stroke(&self.device, &mut enc);
+        // Tier 1 (S1b): an exact-shape selection (Ellipse/Lasso) masks the just-finished
+        // stroke against its precise boundary — the GPU scissor during painting only
+        // constrained dabs to the selection's bounding box.
+        match &self.selection_extra {
+            Some(shape) => {
+                let (w, h) = {
+                    let c = &self.layers[self.active_layer].canvas;
+                    (c.width() as usize, c.height() as usize)
+                };
+                let mask = rasterize_selection_mask(w, h, shape);
+                self.layers[self.active_layer].canvas.end_stroke_masked(
+                    &self.device, &self.queue, &mut enc, &mask, w,
+                );
+            }
+            None => {
+                self.layers[self.active_layer].canvas.end_stroke(&self.device, &mut enc);
+            }
+        }
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = true;
     }
