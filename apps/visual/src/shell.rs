@@ -96,6 +96,10 @@ pub struct ShellState {
     /// Synced from `InputState::select_rect` before each frame; drives the overlay + the
     /// GPU scissor (via `Renderer::selection_rect`).
     pub selection_rect: Option<[f32; 4]>,
+    /// Tier 1: the selection's exact shape when it isn't a plain rectangle (Ellipse/Lasso).
+    /// Synced from `InputState::select_extra` before each frame; drives the overlay outline
+    /// and (via `Renderer::selection_extra`) exact-shape masking in Gradient/Move.
+    pub selection_extra: Option<suite_gpu::SelectionShape>,
     /// Gradient tool: radial when true, linear when false.
     pub gradient_radial: bool,
     /// Live gradient guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
@@ -153,6 +157,7 @@ impl Default for ShellState {
             active_layer: 0,
             pending_layer_cmd: None,
             selection_rect: None,
+            selection_extra: None,
             gradient_radial: false,
             gradient_preview: None,
             move_preview: None,
@@ -399,6 +404,8 @@ pub fn draw_shell(
                     (Tool::Translate, "Mov", "2"),
                     (Tool::Paint, "Pnt", "B"),
                     (Tool::RectSelect, "Mrq", "M"),
+                    (Tool::EllipseSelect, "Elps", "·"),
+                    (Tool::Lasso, "Lso", "L"),
                     (Tool::Gradient, "Grd", "G"),
                     (Tool::MoveLayer, "MovL", "V"),
                     (Tool::AddCube, "Cub", "3"),
@@ -436,7 +443,8 @@ pub fn draw_shell(
                     if resp.clicked() {
                         match tool {
                             Tool::Select | Tool::Translate | Tool::Paint
-                            | Tool::RectSelect | Tool::Gradient | Tool::MoveLayer | Tool::Eyedropper => {
+                            | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
+                            | Tool::Gradient | Tool::MoveLayer | Tool::Eyedropper => {
                                 state.tool = tool
                             }
                             Tool::AddCube => {
@@ -682,15 +690,20 @@ pub fn draw_shell(
                 ui.add_space(12.0);
             }
 
-            if state.tool == Tool::RectSelect {
+            if matches!(state.tool, Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso) {
                 ui.separator();
                 ui.add_space(8.0);
                 ui.label(RichText::new("Selection").color(TEXT_0).strong());
                 ui.add_space(4.0);
+                let shape_kind = match &state.selection_extra {
+                    Some(suite_gpu::SelectionShape::Ellipse { .. }) => "Ellipse",
+                    Some(suite_gpu::SelectionShape::Polygon(_)) => "Lasso",
+                    None => "Rect",
+                };
                 match state.selection_rect {
                     Some([x0, y0, x1, y1]) => {
                         ui.label(RichText::new(format!(
-                            "Active: ({:.0}%,{:.0}%) → ({:.0}%,{:.0}%)",
+                            "Active ({shape_kind}): ({:.0}%,{:.0}%) → ({:.0}%,{:.0}%)",
                             x0 * 100.0, y0 * 100.0, x1 * 100.0, y1 * 100.0
                         )).color(TEXT_2).small());
                     }
@@ -702,9 +715,11 @@ pub fn draw_shell(
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("Select All (⌘A)").color(TEXT_0)).clicked() {
                         state.selection_rect = Some([0.0, 0.0, 1.0, 1.0]);
+                        state.selection_extra = None;
                     }
                     if ui.button(RichText::new("Deselect (⌘D)").color(TEXT_0)).clicked() {
                         state.selection_rect = None;
+                        state.selection_extra = None;
                     }
                 });
                 ui.add_space(4.0);
@@ -716,6 +731,7 @@ pub fn draw_shell(
                         None => Some([0.0, 0.0, 1.0, 1.0]),
                         _ => None, // partial selection → deselect (full invert needs polygon)
                     };
+                    state.selection_extra = None;
                 }
                 ui.add_space(8.0);
                 // M4: crop the whole document down to the selection rect. Disabled with no
@@ -726,9 +742,14 @@ pub fn draw_shell(
                     state.pending_crop = state.selection_rect;
                 }
                 ui.add_space(4.0);
-                ui.label(RichText::new("Crops every layer + the canvas to the selection. Not undoable.").color(TEXT_2).small());
+                let crop_hint = if state.selection_extra.is_some() {
+                    "Crops every layer + the canvas to the selection's bounding rect (crop is always rectangular). Not undoable."
+                } else {
+                    "Crops every layer + the canvas to the selection. Not undoable."
+                };
+                ui.label(RichText::new(crop_hint).color(TEXT_2).small());
                 ui.add_space(8.0);
-                ui.label(RichText::new("Switch to Paint (B) to paint inside the selection.").color(TEXT_2).small());
+                ui.label(RichText::new("Gradient/Move respect the exact shape (Ellipse/Lasso); Paint is still bounded by the rect for now.").color(TEXT_2).small());
                 ui.add_space(12.0);
             }
 
@@ -1417,13 +1438,32 @@ pub fn draw_shell(
         egui::Order::Foreground,
         egui::Id::new("canvas_overlay"),
     ));
-    if let Some([u0, v0, u1, v1]) = state.selection_rect {
+    if state.selection_rect.is_some() {
         let rect = canvas_rect;
-        let x0 = rect.left()   + u0 * rect.width();
-        let y0 = rect.top()    + v0 * rect.height();
-        let x1 = rect.left()   + u1 * rect.width();
-        let y1 = rect.top()    + v1 * rect.height();
-        let sel = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+        let to_screen = |u: f32, v: f32| egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height());
+        // Tier 1: trace the exact shape (Ellipse as an N-gon approximation, Lasso as its own
+        // point path) instead of always drawing the bounding rect — falls back to the plain
+        // rect when there's no exact shape (RectSelect, the common case, unchanged).
+        let corners: Vec<egui::Pos2> = match &state.selection_extra {
+            Some(suite_gpu::SelectionShape::Ellipse { cx, cy, rx, ry }) => {
+                const SEGMENTS: usize = 48;
+                (0..=SEGMENTS)
+                    .map(|i| {
+                        let a = (i as f32 / SEGMENTS as f32) * std::f32::consts::TAU;
+                        to_screen(cx + rx * a.cos(), cy + ry * a.sin())
+                    })
+                    .collect()
+            }
+            Some(suite_gpu::SelectionShape::Polygon(points)) if points.len() >= 2 => points
+                .iter()
+                .chain(points.first())
+                .map(|p| to_screen(p[0], p[1]))
+                .collect(),
+            _ => {
+                let [u0, v0, u1, v1] = state.selection_rect.unwrap();
+                vec![to_screen(u0, v0), to_screen(u1, v0), to_screen(u1, v1), to_screen(u0, v1), to_screen(u0, v0)]
+            }
+        };
         // Marching-ants: alternating white/black dashed border.
         let t = ui.ctx().input(|i| i.time) as f32;
         let march_speed = 40.0_f32; // pixels per second
@@ -1431,25 +1471,22 @@ pub fn draw_shell(
         let gap  = 6.0_f32;
         let period = dash + gap;
         let phase = (t * march_speed).rem_euclid(period);
-        let corners = [
-            egui::pos2(x0, y0), egui::pos2(x1, y0),
-            egui::pos2(x1, y1), egui::pos2(x0, y1),
-            egui::pos2(x0, y0),
-        ];
         let white_shapes = egui::Shape::dashed_line(
             &corners, egui::Stroke::new(2.0, egui::Color32::WHITE), dash, gap,
         );
         painter.extend(white_shapes);
-        // Black inner dashes offset by half a period to fill the white gaps.
-        let perim = 2.0 * (sel.width() + sel.height());
+        // Black inner dashes offset by half a period to fill the white gaps. Perimeter is
+        // the actual path length (sum of segment lengths), not a rect-only shortcut, so this
+        // works for the ellipse/polygon traces too.
+        let segs: Vec<(egui::Pos2, egui::Pos2)> = corners.windows(2).map(|w| (w[0], w[1])).collect();
+        let perim: f32 = segs.iter().map(|(a, b)| (*b - *a).length()).sum();
         if perim > 0.0 {
             let start_frac = phase / perim;
             let start_d = start_frac * perim + period * 0.5;
             let mut shifted: Vec<egui::Pos2> = Vec::with_capacity(corners.len() + 1);
-            let segs: Vec<(egui::Pos2, egui::Pos2)> = corners.windows(2).map(|w| (w[0], w[1])).collect();
             let mut accum = 0.0_f32;
             let mut started = false;
-            let mut extra_start = egui::pos2(x0, y0);
+            let mut extra_start = corners[0];
             for (a, b) in &segs {
                 let seg_len = (*b - *a).length();
                 if !started && accum + seg_len >= start_d % perim {

@@ -36,8 +36,9 @@ The current rectangle-only selection + no masks is the biggest _depth_ gap on th
 
 | # | Item | Why it matters | Effort | Notes |
 |---|---|---|---|---|
-| S1 | **Selection mask texture** | Unlocks everything below; replaces the single scissor-rect. | M | Per-pixel alpha mask instead of a rect; paint/gradient/adjustments sample it. |
-| S2 | **Lasso + polygon + wand-as-selection + feather** | Real selection toolkit. | M | Builds directly on S1 (wand already exists as a fill; retarget to write the mask; feather = blur the mask). |
+| S1 | ~~**Selection mask texture**~~ **DONE (core) 2026-07-06** | Unlocks everything below. | M | Shipped: `SelectionShape{Ellipse,Polygon}` + `rasterize_selection_mask` (on-demand CPU mask, not a standing per-frame buffer). Gradient + Move consult it for exact-shape correctness; the rect bound still drives the GPU scissor/Crop, unchanged. **Not yet masked: brush painting** inside a non-rect selection (still bounded by the bbox scissor only) — see S1b below. |
+| S1b | **Masked brush painting** | Paint should respect the exact Ellipse/Lasso shape, not just its bounding box. | M | Needs either a mask-sampling brush shader (bind-group change to the brush pipeline) or a stroke-end CPU blend against `pre_stroke` using the mask — the latter avoids touching the shared brush pipeline all other painting depends on. |
+| S2 | ~~**Ellipse + Lasso selection**~~ **DONE 2026-07-06** | Real selection toolkit. | M | Shipped: `Tool::EllipseSelect` ("Elps") and `Tool::Lasso` ("Lso", hotkey **L**), both on the S1 mask infrastructure. Marching-ants generalized to trace the exact shape (ellipse as an N-gon, lasso as its own point path), not just a rect. **Still open:** Quick Selection / retargeting Magic Wand to produce a mask-based selection instead of directly flood-filling; feather (blur the mask edge). |
 | S3 | **Layer masks** | The core of non-destructive editing. | M | Reuse the S1 mask machinery per layer. |
 
 ## Tier 2 — 3D interop & material credibility
@@ -93,9 +94,9 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 |---|---|---|
 | Move | ✅ `Tool::MoveLayer` (M4d, 2026-07-06) | — |
 | Rectangular Marquee | ✅ `RectSelect` (M3) | — |
-| Elliptical / Row / Column Marquee | ⬜ needs a real per-pixel mask, not a bounding-rect scissor | Tier 1 (S1 first) |
-| Lasso / Polygonal / Magnetic Lasso | ⬜ | Tier 1 (S2) |
-| Quick Selection | ⬜ | Tier 1 (S2) |
+| Elliptical Marquee | ✅ `Tool::EllipseSelect` (S1/S2, 2026-07-06) — Row/Column variants still ⬜ (niche) | — |
+| Lasso | ✅ `Tool::Lasso` (S2, 2026-07-06) — Polygonal/Magnetic variants still ⬜ | — |
+| Quick Selection | ⬜ — retargeting Magic Wand to produce a mask instead of directly flood-filling | Tier 1 (tracked, small now that S1 exists) |
 | Magic Wand | 🟡 have — but it directly flood-fills, doesn't produce a reusable selection like Photoshop's | Tier 1 (S2) retargets it |
 | Crop | ✅ `crop_to_rect` (M4b) | — |
 | Perspective Crop / Slice / Frame | ⬜ niche | Not scheduled |

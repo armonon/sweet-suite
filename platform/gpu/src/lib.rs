@@ -205,6 +205,100 @@ pub enum CanvasRotate {
     Ccw,
 }
 
+/// **Tier 1**: a selection's exact shape when it isn't a plain rectangle. Coordinates are
+/// UV space (0..1, top-left origin) — same convention as `Renderer::selection_rect`.
+/// Rasterized into a per-pixel mask on demand by `rasterize_selection_mask` wherever a
+/// gradient/move needs exact-shape correctness, rather than kept as a standing canvas-sized
+/// buffer synced every frame (selections change far less often than frames render).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SelectionShape {
+    /// Centre `(cx, cy)` and radii `(rx, ry)`, all UV. A plain ellipse inscribed in the
+    /// drag's bounding box — `rx`/`ry` are independent per-axis, so (unlike a round brush
+    /// dab) no aspect correction is needed: an ellipse already has separate x/y extents.
+    Ellipse { cx: f32, cy: f32, rx: f32, ry: f32 },
+    /// A closed polygon (implicitly closed — the last point connects back to the first).
+    /// UV-space vertices, in drag order.
+    Polygon(Vec<[f32; 2]>),
+}
+
+/// **Pure**: rasterize a `SelectionShape` into a full-canvas mask (row-major, one byte per
+/// texel: 0 = unselected, 255 = fully selected). The boundary is antialiased over roughly
+/// one texel so edges aren't jagged.
+pub fn rasterize_selection_mask(width: usize, height: usize, shape: &SelectionShape) -> Vec<u8> {
+    let mut mask = vec![0u8; width * height];
+    match shape {
+        SelectionShape::Ellipse { cx, cy, rx, ry } => {
+            let (cx, cy) = (cx * width as f32, cy * height as f32);
+            let rx = (rx * width as f32).max(0.5);
+            let ry = (ry * height as f32).max(0.5);
+            for y in 0..height {
+                for x in 0..width {
+                    let px = x as f32 + 0.5;
+                    let py = y as f32 + 0.5;
+                    let nx = (px - cx) / rx;
+                    let ny = (py - cy) / ry;
+                    let d = (nx * nx + ny * ny).sqrt();
+                    // Antialias over roughly one texel's worth of normalized distance.
+                    let aa = (1.0 / rx.min(ry).max(1.0)).max(0.02);
+                    let coverage = (1.0 - ((d - 1.0) / aa).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+                    mask[y * width + x] = (coverage * 255.0).round() as u8;
+                }
+            }
+        }
+        SelectionShape::Polygon(points) => {
+            if points.len() < 3 {
+                return mask;
+            }
+            let px: Vec<f32> = points.iter().map(|p| p[0] * width as f32).collect();
+            let py: Vec<f32> = points.iter().map(|p| p[1] * height as f32).collect();
+            // Even-odd scanline fill: for each row, find edge crossings, sort, fill between pairs.
+            for y in 0..height {
+                let sy = y as f32 + 0.5;
+                let mut xs: Vec<f32> = Vec::new();
+                let n = px.len();
+                for i in 0..n {
+                    let j = (i + 1) % n;
+                    let (y0, y1) = (py[i], py[j]);
+                    if (y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy) {
+                        let t = (sy - y0) / (y1 - y0);
+                        xs.push(px[i] + t * (px[j] - px[i]));
+                    }
+                }
+                xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                for pair in xs.chunks_exact(2) {
+                    let (x0, x1) = (pair[0], pair[1]);
+                    let start = x0.floor().max(0.0) as usize;
+                    let end = (x1.ceil() as usize).min(width);
+                    for x in start..end {
+                        mask[y * width + x] = 255;
+                    }
+                }
+            }
+        }
+    }
+    mask
+}
+
+/// Bounding box (UV space, `[x0, y0, x1, y1]`) of a `SelectionShape` — used as the fast-path
+/// `selection_rect` (GPU scissor bound) alongside the exact mask.
+pub fn selection_shape_bounds(shape: &SelectionShape) -> [f32; 4] {
+    match shape {
+        SelectionShape::Ellipse { cx, cy, rx, ry } => {
+            [(cx - rx).max(0.0), (cy - ry).max(0.0), (cx + rx).min(1.0), (cy + ry).min(1.0)]
+        }
+        SelectionShape::Polygon(points) => {
+            let (mut x0, mut y0, mut x1, mut y1) = (1.0f32, 1.0f32, 0.0f32, 0.0f32);
+            for p in points {
+                x0 = x0.min(p[0]);
+                y0 = y0.min(p[1]);
+                x1 = x1.max(p[0]);
+                y1 = y1.max(p[1]);
+            }
+            [x0.max(0.0), y0.max(0.0), x1.min(1.0), y1.min(1.0)]
+        }
+    }
+}
+
 // sRGB <-> linear transfer (the paint texture is `Rgba8UnormSrgb`, so direct CPU pixel
 // edits must encode/decode to composite correctly in linear space).
 #[inline]
@@ -232,6 +326,7 @@ pub fn apply_gradient_fill(
     color_b: [f32; 4],
     radial: bool,
     selection: Option<[f32; 4]>,
+    mask: Option<&[u8]>,
 ) {
     let (sx0, sy0, sx1, sy1) = match selection {
         Some([x0, y0, x1, y1]) if x1 > x0 && y1 > y0 => (
@@ -266,7 +361,12 @@ pub fn apply_gradient_fill(
             let sr = color_a[0] + (color_b[0] - color_a[0]) * t;
             let sg = color_a[1] + (color_b[1] - color_a[1]) * t;
             let sb = color_a[2] + (color_b[2] - color_a[2]) * t;
-            let sa = color_a[3] + (color_b[3] - color_a[3]) * t;
+            let mut sa = color_a[3] + (color_b[3] - color_a[3]) * t;
+            // Tier 1: an exact-shape selection (Ellipse/Lasso) attenuates alpha by the
+            // mask's coverage at this texel — the rect above is only the coarse bound.
+            if let Some(m) = mask {
+                sa *= m[y * width + x] as f32 / 255.0;
+            }
             if sa <= 0.0 {
                 continue;
             }
@@ -391,11 +491,22 @@ pub fn move_selection_pixels(
     sel_h: usize,
     dx: i32,
     dy: i32,
+    mask: Option<&[u8]>,
 ) -> Vec<u8> {
+    // Tier 1: `mask` (full-canvas) narrows the moved region to an exact shape (Ellipse/
+    // Lasso) within the `sel_*` bounding rect — a texel with mask=0 is left untouched
+    // (not cleared, not moved), same as Photoshop moving only the selected pixels.
+    let mask_at = |x: usize, y: usize| -> f32 {
+        match mask {
+            Some(m) => m[(sel_y0 + y) * width + (sel_x0 + x)] as f32 / 255.0,
+            None => 1.0,
+        }
+    };
+
     let region = crop_pixels(src, width, height, sel_x0, sel_y0, sel_w, sel_h);
     let mut dst = src.to_vec();
 
-    // Clear the original selection region to transparent.
+    // Clear the original selection region to transparent (only where the mask selects it).
     let clear_w = sel_w.min(width.saturating_sub(sel_x0));
     for y in 0..sel_h {
         let row = sel_y0 + y;
@@ -404,6 +515,9 @@ pub fn move_selection_pixels(
         }
         let row_start = (row * width + sel_x0) * 4;
         for i in 0..clear_w {
+            if mask_at(i, y) <= 0.0 {
+                continue;
+            }
             let p = row_start + i * 4;
             dst[p..p + 4].copy_from_slice(&[0, 0, 0, 0]);
         }
@@ -421,7 +535,7 @@ pub fn move_selection_pixels(
                 continue;
             }
             let si = (y * sel_w + x) * 4;
-            let sa = region[si + 3] as f32 / 255.0;
+            let sa = (region[si + 3] as f32 / 255.0) * mask_at(x, y);
             if sa <= 0.0 {
                 continue;
             }
@@ -723,7 +837,17 @@ pub struct Renderer {
     /// Active selection rectangle in UV space `[x0, y0, x1, y1]` (0..1, top-left origin).
     /// When `Some`, brush stamps are clipped to this region via a GPU scissor rect. Set by
     /// the app from `InputState::select_rect`; `None` means "paint anywhere" (no selection).
+    /// Always the selection's bounding box — even when `selection_extra` narrows the actual
+    /// selected shape further (Ellipse/Lasso), this stays the rect that bounds it, so the
+    /// existing scissor/crop fast paths don't need to change.
     pub selection_rect: Option<[f32; 4]>,
+    /// Tier 1: the selection's exact shape when it's *not* a plain rectangle. `None` means
+    /// the selection (if any) is exactly `selection_rect` — the common case (`RectSelect`),
+    /// left completely untouched by this. `Some` means gradient/move should mask by the
+    /// exact shape instead of just the bounding rect; brush painting still only respects the
+    /// bounding-rect scissor for now (masked *painting* is a tracked follow-up — see
+    /// ROADMAP.md Tier 1).
+    pub selection_extra: Option<SelectionShape>,
 }
 
 impl Renderer {
@@ -1222,6 +1346,7 @@ impl Renderer {
             snap_indicator: None,
             skeleton_segments: Vec::new(),
             selection_rect: None,
+            selection_extra: None,
         }
     }
 
@@ -1915,6 +2040,11 @@ impl Renderer {
         };
         let src = self.read_active_layer_rgba();
 
+        // Tier 1: an exact-shape selection rasterizes into a mask on demand (see
+        // `paint_gradient_fill`) so Move only cuts the pixels actually inside it, not the
+        // whole bounding rect.
+        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+
         let sel_texel = self.selection_rect.and_then(|[x0, y0, x1, y1]| {
             if x1 <= x0 || y1 <= y0 {
                 return None;
@@ -1928,7 +2058,7 @@ impl Renderer {
 
         let (dst, new_selection_uv) = match sel_texel {
             Some((sx0, sy0, sw, sh)) => {
-                let moved = move_selection_pixels(&src, w, h, sx0, sy0, sw, sh, dx, dy);
+                let moved = move_selection_pixels(&src, w, h, sx0, sy0, sw, sh, dx, dy, mask.as_deref());
                 let nx0 = (sx0 as i32 + dx).clamp(0, w as i32) as f32 / w as f32;
                 let ny0 = (sy0 as i32 + dy).clamp(0, h as i32) as f32 / h as f32;
                 let nx1 = ((sx0 + sw) as i32 + dx).clamp(0, w as i32) as f32 / w as f32;
@@ -1938,6 +2068,25 @@ impl Renderer {
             None => (shift_pixels(&src, w, h, dx, dy), None),
         };
         self.write_active_layer_undoable(&dst);
+
+        // Shift the exact shape by the same UV delta so it stays aligned with the moved
+        // content (an Ellipse/Lasso selection should follow what it selected, same as
+        // Photoshop's marching ants tracking a moved selection).
+        if let Some(shape) = self.selection_extra.as_mut() {
+            let (udx, udy) = (dx as f32 / w as f32, dy as f32 / h as f32);
+            match shape {
+                SelectionShape::Ellipse { cx, cy, .. } => {
+                    *cx += udx;
+                    *cy += udy;
+                }
+                SelectionShape::Polygon(points) => {
+                    for p in points.iter_mut() {
+                        p[0] += udx;
+                        p[1] += udy;
+                    }
+                }
+            }
+        }
         new_selection_uv
     }
 
@@ -2134,6 +2283,9 @@ impl Renderer {
             (c.width() as usize, c.height() as usize)
         };
         let mut pixels = self.read_active_layer_rgba();
+        // Tier 1: an exact-shape selection (Ellipse/Lasso) rasterizes into a mask on demand
+        // — cheap enough here since it happens once per gradient drag, not once per frame.
+        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
         apply_gradient_fill(
             &mut pixels,
             w,
@@ -2144,6 +2296,7 @@ impl Renderer {
             color_b,
             radial,
             self.selection_rect,
+            mask.as_deref(),
         );
         self.write_active_layer_undoable(&pixels);
     }
@@ -3097,7 +3250,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, move_selection_pixels, rotate_canvas_pixels, shift_pixels, LayerTransform};
+    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -3230,13 +3383,70 @@ mod m4_tests {
             }
         }
         // Move that 3x3 selection by (+4, 0).
-        let out = move_selection_pixels(&src, w, h, 2, 2, 3, 3, 4, 0);
+        let out = move_selection_pixels(&src, w, h, 2, 2, 3, 3, 4, 0, None);
         // The original spot is now a transparent hole (not black background — genuinely cut).
         assert_eq!(px(&out, w, 3, 3), [0, 0, 0, 0], "original selection spot is a hole");
         // The new spot (2+4, 2) through (5+4-1, 4) shows the moved white block.
         assert_eq!(px(&out, w, 6, 3)[0], 255, "moved content lands at the new spot");
         // Untouched background elsewhere is still opaque black.
         assert_eq!(px(&out, w, 0, 0), [0, 0, 0, 255]);
+    }
+
+    // ----- Tier 1: selection mask (Ellipse / Lasso) -------------------------------------
+
+    #[test]
+    fn ellipse_mask_selects_center_and_excludes_corners() {
+        let (w, h) = (40, 40);
+        // A circle centred at (0.5,0.5) with radius 0.25 (in UV) — well inside the canvas.
+        let shape = SelectionShape::Ellipse { cx: 0.5, cy: 0.5, rx: 0.25, ry: 0.25 };
+        let mask = rasterize_selection_mask(w, h, &shape);
+        // Dead centre is fully selected.
+        assert_eq!(mask[h / 2 * w + w / 2], 255);
+        // The far corner (0,0) is well outside the circle — unselected.
+        assert_eq!(mask[0], 0);
+    }
+
+    #[test]
+    fn ellipse_mask_respects_independent_x_and_y_radii() {
+        // A wide ellipse (rx=0.4, ry=0.1) on a SQUARE canvas: a point far out on the x-axis
+        // from centre should be selected, but the same offset on the y-axis should not —
+        // proving rx/ry aren't accidentally aspect-corrected against each other (unlike a
+        // round brush dab, an ellipse's radii are already independent per axis).
+        let (w, h) = (100, 100);
+        let shape = SelectionShape::Ellipse { cx: 0.5, cy: 0.5, rx: 0.4, ry: 0.1 };
+        let mask = rasterize_selection_mask(w, h, &shape);
+        let at = |ux: f32, uy: f32| {
+            let x = (ux * w as f32) as usize;
+            let y = (uy * h as f32) as usize;
+            mask[y * w + x]
+        };
+        assert!(at(0.85, 0.5) > 200, "far out on the wide x-axis should still be inside");
+        assert!(at(0.5, 0.85) < 50, "the same offset on the narrow y-axis should be outside");
+    }
+
+    #[test]
+    fn polygon_mask_fills_a_triangle_and_excludes_outside() {
+        let (w, h) = (20, 20);
+        // A triangle covering roughly the left half of the canvas.
+        let shape = SelectionShape::Polygon(vec![[0.0, 0.0], [0.6, 0.0], [0.0, 1.0]]);
+        let mask = rasterize_selection_mask(w, h, &shape);
+        // A point clearly inside the triangle (near its (0,0) corner).
+        assert_eq!(mask[2 * w + 2], 255, "inside the triangle");
+        // A point clearly outside (top-right corner, opposite the hypotenuse).
+        assert_eq!(mask[1 * w + 18], 0, "outside the triangle");
+    }
+
+    #[test]
+    fn selection_shape_bounds_computes_the_right_bbox() {
+        let ellipse = SelectionShape::Ellipse { cx: 0.5, cy: 0.4, rx: 0.2, ry: 0.1 };
+        let b = selection_shape_bounds(&ellipse);
+        assert!((b[0] - 0.3).abs() < 1e-5 && (b[2] - 0.7).abs() < 1e-5);
+        assert!((b[1] - 0.3).abs() < 1e-5 && (b[3] - 0.5).abs() < 1e-5);
+
+        let poly = SelectionShape::Polygon(vec![[0.1, 0.2], [0.8, 0.3], [0.4, 0.9]]);
+        let b = selection_shape_bounds(&poly);
+        assert!((b[0] - 0.1).abs() < 1e-5 && (b[2] - 0.8).abs() < 1e-5);
+        assert!((b[1] - 0.2).abs() < 1e-5 && (b[3] - 0.9).abs() < 1e-5);
     }
 
     #[test]
@@ -3257,6 +3467,7 @@ mod m4_tests {
             [1.0, 1.0, 1.0, 1.0], // white, opaque at start
             [1.0, 1.0, 1.0, 0.0], // white, transparent at end
             false,
+            None,
             None,
         );
         let mid_row = h / 2;
@@ -3291,10 +3502,40 @@ mod m4_tests {
             [1.0, 0.0, 0.0, 1.0],
             false,
             Some([0.0, 0.0, 0.5, 1.0]), // left half only
+            None,
         );
         let inside = px(&buf, w, 2, 8);
         assert!(inside[0] > 200 && inside[1] < 40, "inside selection is red, got {inside:?}");
         let outside = px(&buf, w, 12, 8);
         assert_eq!(outside, [0, 0, 0, 255], "outside selection stays untouched");
+    }
+
+    /// Tier 1: a mask constrains the gradient to the exact shape, not just its bounding
+    /// rect — a corner of the rect that's outside the ellipse must stay untouched.
+    #[test]
+    fn gradient_respects_an_exact_shape_mask_not_just_its_bounding_rect() {
+        let (w, h) = (40, 40);
+        let mut buf = vec![0u8; w * h * 4];
+        for p in buf.chunks_mut(4) {
+            p[3] = 255; // opaque black
+        }
+        let shape = SelectionShape::Ellipse { cx: 0.5, cy: 0.5, rx: 0.2, ry: 0.2 };
+        let bounds = selection_shape_bounds(&shape);
+        let mask = rasterize_selection_mask(w, h, &shape);
+        apply_gradient_fill(
+            &mut buf, w, h,
+            [0.0, 0.5], [0.0, 0.5], // zero-length -> t=0 everywhere -> color_a
+            [1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0],
+            false,
+            Some(bounds),
+            Some(&mask),
+        );
+        // Dead centre (inside both the rect AND the ellipse) is red.
+        let center = px(&buf, w, 20, 20);
+        assert!(center[0] > 200 && center[1] < 40, "centre is red, got {center:?}");
+        // A corner of the ellipse's bounding rect (inside the rect, but outside the circle)
+        // must stay untouched — proving the mask, not just the rect, gates the fill.
+        let rect_corner = px(&buf, w, (bounds[0] * w as f32) as usize + 1, (bounds[1] * h as f32) as usize + 1);
+        assert_eq!(rect_corner, [0, 0, 0, 255], "bounding-rect corner outside the ellipse stays untouched");
     }
 }

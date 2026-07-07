@@ -20,6 +20,8 @@ pub enum Tool {
     Translate,
     Paint,
     RectSelect,
+    EllipseSelect,
+    Lasso,
     Gradient,
     MoveLayer,
     AddCube,
@@ -40,6 +42,8 @@ impl Tool {
             Self::Translate => "Move",
             Self::Paint => "Paint",
             Self::RectSelect => "Rect Select",
+            Self::EllipseSelect => "Ellipse Select",
+            Self::Lasso => "Lasso",
             Self::Gradient => "Gradient",
             Self::MoveLayer => "Move Layer",
             Self::AddCube => "Add Cube",
@@ -59,6 +63,8 @@ impl Tool {
             Self::Translate => "Drag a colored arrow to slide along one axis. Drag elsewhere to free-translate along the camera plane.",
             Self::Paint => "Drag on a Paint Canvas or directly on a 3D mesh to paint. Tune the brush in the inspector. Try the flat (ortho) view for a face-on artboard.",
             Self::RectSelect => "Drag to draw a selection rectangle on the canvas. Paint only affects pixels inside. ⌘A=all · ⌘D=deselect.",
+            Self::EllipseSelect => "Drag to draw an elliptical selection (inscribed in the drag's bounding box). Gradient/Move respect the exact shape; Crop uses its bounding rect.",
+            Self::Lasso => "Drag a freehand outline; it closes back to the start on release. Gradient/Move respect the exact shape; Crop uses its bounding rect.",
             Self::Gradient => "Drag on the canvas to fill the active layer with a gradient from the brush colour to transparent (or pick endpoints in the inspector). Linear or radial. Respects the active selection. G to activate.",
             Self::MoveLayer => "Drag on the canvas to move the active layer's pixels. With an active selection, only the selected pixels move (leaving a transparent hole). V to activate.",
             Self::AddCube => "Adds a unit cube where you click and selects it.",
@@ -126,7 +132,19 @@ pub struct InputState {
     pub select_drag_start: Option<[f32; 2]>,
     /// The current active selection rectangle in UV space `[x0, y0, x1, y1]`. `None` = no
     /// selection (paint everywhere). Synced into `ShellState::selection_rect` each frame.
+    /// Always the bounding box of the selection — even an Ellipse/Lasso (`select_extra`)
+    /// keeps this in sync as its bounds, so the scissor/crop fast paths stay unchanged.
     pub select_rect: Option<[f32; 4]>,
+    /// Tier 1: the selection's exact shape when it isn't a plain rectangle (Ellipse/Lasso).
+    /// `None` means the selection (if any) is exactly `select_rect`. Synced into
+    /// `ShellState::selection_extra` each frame, same as `select_rect`.
+    pub select_extra: Option<suite_gpu::SelectionShape>,
+    /// EllipseSelect drag start UV `[u, v]`, set on press (same shape as `select_drag_start`).
+    pub ellipse_drag_start: Option<[f32; 2]>,
+    /// Lasso: the freehand point path traced so far this drag, in UV space. Cleared on
+    /// press, appended on every cursor move while dragging, rasterized into a `Polygon`
+    /// selection on release.
+    pub lasso_points: Vec<[f32; 2]>,
     /// Gradient tool drag: start UV `[u, v]` set on press; live endpoint follows the cursor.
     pub gradient_drag_start: Option<[f32; 2]>,
     /// Live gradient endpoints `[u0, v0, u1, v1]` in UV space while dragging — drawn as a
@@ -428,6 +446,49 @@ pub fn handle_cursor_moved(
         return;
     }
 
+    // Held drag — EllipseSelect: same bounding-box drag as RectSelect, but also records the
+    // exact ellipse shape (Tier 1) so Gradient/Move can respect it, not just the bbox.
+    if shell.tool == Tool::EllipseSelect && input.left_pressed {
+        let canvas = shell.canvas_rect(renderer.size());
+        let (l, t, r, b) = canvas;
+        let cw = (r - l).max(1.0);
+        let ch = (b - t).max(1.0);
+        let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+        let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+        if let Some([u0, v0]) = input.ellipse_drag_start {
+            let (x0, y0, x1, y1) = (u.min(u0), v.min(v0), u.max(u0), v.max(v0));
+            input.select_rect = Some([x0, y0, x1, y1]);
+            input.select_extra = Some(suite_gpu::SelectionShape::Ellipse {
+                cx: (x0 + x1) * 0.5,
+                cy: (y0 + y1) * 0.5,
+                rx: (x1 - x0) * 0.5,
+                ry: (y1 - y0) * 0.5,
+            });
+        }
+        return;
+    }
+
+    // Held drag — Lasso: append the cursor's UV position to the traced point path. Also
+    // sets `select_extra` live (not just on release) so the overlay can draw the growing
+    // outline using the exact same Polygon-drawing path as the finalized selection.
+    if shell.tool == Tool::Lasso && input.left_pressed {
+        let canvas = shell.canvas_rect(renderer.size());
+        let (l, t, r, b) = canvas;
+        let cw = (r - l).max(1.0);
+        let ch = (b - t).max(1.0);
+        let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+        let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+        input.lasso_points.push([u, v]);
+        if input.lasso_points.len() >= 2 {
+            let shape = suite_gpu::SelectionShape::Polygon(input.lasso_points.clone());
+            // Keep select_rect in sync as the shape's bounding box — the degenerate-size
+            // check in handle_left_release, and the scissor/crop fast paths, both read it.
+            input.select_rect = Some(suite_gpu::selection_shape_bounds(&shape));
+            input.select_extra = Some(shape);
+        }
+        return;
+    }
+
     // Held drag — Gradient: track the live endpoint for the overlay guide line.
     if shell.tool == Tool::Gradient && input.left_pressed {
         let (l, t, r, b) = shell.canvas_rect(renderer.size());
@@ -633,6 +694,28 @@ pub fn handle_left_press(
             input.select_drag_start = Some([u, v]);
             // A fresh drag replaces the old selection. Zero-size rect shows while dragging.
             input.select_rect = Some([u, v, u, v]);
+            input.select_extra = None;
+        }
+        Tool::EllipseSelect => {
+            let (l, t, r, b) = canvas;
+            let cw = (r - l).max(1.0);
+            let ch = (b - t).max(1.0);
+            let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+            let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+            input.ellipse_drag_start = Some([u, v]);
+            input.select_rect = Some([u, v, u, v]);
+            input.select_extra = Some(suite_gpu::SelectionShape::Ellipse { cx: u, cy: v, rx: 0.0, ry: 0.0 });
+        }
+        Tool::Lasso => {
+            let (l, t, r, b) = canvas;
+            let cw = (r - l).max(1.0);
+            let ch = (b - t).max(1.0);
+            let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+            let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+            input.lasso_points.clear();
+            input.lasso_points.push([u, v]);
+            input.select_rect = Some([u, v, u, v]);
+            input.select_extra = None; // needs >= 2 points before it's a real shape
         }
         Tool::Gradient => {
             // Record the gradient start point in UV; the drag sets the endpoint, release fills.
@@ -764,12 +847,24 @@ pub fn handle_left_release(input: &mut InputState) {
     input.paint_mesh_last_uv = None;
     input.snap_indicator = None;
     input.stabilizer.reset();
-    // RectSelect: clear the drag anchor — the finalized rect stays in select_rect.
+    // RectSelect/EllipseSelect: clear the drag anchors — the finalized shape stays in
+    // select_rect/select_extra.
     input.select_drag_start = None;
+    input.ellipse_drag_start = None;
+    // Lasso: fewer than 3 points can't close into a real polygon — cancel it. A valid
+    // trace is already stored in select_extra (set live during the drag).
+    if input.lasso_points.len() < 3 {
+        if input.select_extra.is_some() {
+            input.select_rect = None;
+            input.select_extra = None;
+        }
+    }
+    input.lasso_points.clear();
     // Degenerate selections (less than 2 texels wide or tall) are cancelled.
     if let Some([x0, y0, x1, y1]) = input.select_rect {
         if (x1 - x0) < 0.001 || (y1 - y0) < 0.001 {
             input.select_rect = None;
+            input.select_extra = None;
         }
     }
 }

@@ -582,6 +582,11 @@ impl ApplicationHandler for App {
                                         self.shell.selection_rect = Some(new_sel);
                                         self.input.select_rect = Some(new_sel);
                                         renderer.selection_rect = Some(new_sel);
+                                        // move_active_layer already shifted renderer.selection_extra
+                                        // (an Ellipse/Lasso shape) to match — mirror it back out so
+                                        // the overlay traces the moved shape, not the old one.
+                                        self.shell.selection_extra = renderer.selection_extra.clone();
+                                        self.input.select_extra = renderer.selection_extra.clone();
                                     }
                                     self.undo_order.push(UndoKind::Paint);
                                     self.redo_order.clear();
@@ -646,18 +651,24 @@ impl ApplicationHandler for App {
                         // Selection: ⌘A = select all, ⌘D = deselect.
                         KeyCode::KeyA => {
                             self.input.select_rect = Some([0.0, 0.0, 1.0, 1.0]);
+                            self.input.select_extra = None;
                             self.shell.selection_rect = self.input.select_rect;
+                            self.shell.selection_extra = None;
                             if let Some(r) = self.renderer.as_mut() {
                                 r.selection_rect = self.input.select_rect;
+                                r.selection_extra = None;
                             }
                             window.request_redraw();
                             return;
                         }
                         KeyCode::KeyD => {
                             self.input.select_rect = None;
+                            self.input.select_extra = None;
                             self.shell.selection_rect = None;
+                            self.shell.selection_extra = None;
                             if let Some(r) = self.renderer.as_mut() {
                                 r.selection_rect = None;
+                                r.selection_extra = None;
                             }
                             window.request_redraw();
                             return;
@@ -708,6 +719,10 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::KeyM => {
                         self.shell.tool = tools::Tool::RectSelect;
+                        window.request_redraw();
+                    }
+                    KeyCode::KeyL => {
+                        self.shell.tool = tools::Tool::Lasso;
                         window.request_redraw();
                     }
                     KeyCode::KeyS => {
@@ -922,6 +937,9 @@ impl ApplicationHandler for App {
                 // renderer (for GPU scissor on brush stamps).
                 self.shell.selection_rect = self.input.select_rect;
                 renderer.selection_rect = self.shell.selection_rect;
+                // Tier 1: same sync for the exact shape (Ellipse/Lasso), when present.
+                self.shell.selection_extra = self.input.select_extra.clone();
+                renderer.selection_extra = self.shell.selection_extra.clone();
                 // Gradient guide line: input → shell so the overlay can draw the drag.
                 self.shell.gradient_preview = self.input.gradient_preview;
                 // Move guide line: same sync.
@@ -945,6 +963,10 @@ impl ApplicationHandler for App {
                 if self.shell.selection_rect != self.input.select_rect {
                     self.input.select_rect = self.shell.selection_rect;
                     renderer.selection_rect = self.shell.selection_rect;
+                }
+                if self.shell.selection_extra != self.input.select_extra {
+                    self.input.select_extra = self.shell.selection_extra.clone();
+                    renderer.selection_extra = self.shell.selection_extra.clone();
                 }
 
                 // Apply a Layers-panel command issued this frame.
@@ -996,6 +1018,9 @@ impl ApplicationHandler for App {
                     self.shell.selection_rect = None;
                     self.input.select_rect = None;
                     renderer.selection_rect = None;
+                    self.shell.selection_extra = None;
+                    self.input.select_extra = None;
+                    renderer.selection_extra = None;
                     self.shell.dirty = true;
                     window.request_redraw();
                 }

@@ -1351,3 +1351,34 @@ Armon: "make sure we have all photoshop tools." Honest answer first, not a demo:
 Same Screen Recording/Automation permission story as M5 and Crop: blocked by another Claude session holding the computer-use lock for the whole increment. Packaged the app anyway; a live check (drag to move a layer, then with a selection active, confirm the hole + the marching-ants follow the moved content) is still owed.
 
 Next: remaining M4 (text tool, free transform), then Tier 1 (selection mask — the piece that unlocks Elliptical Marquee, Lasso, Quick Selection, Quick Mask, and layer masks all at once).
+
+---
+
+## Tier 1 S1 + S2: selection mask, Ellipse Select, Lasso — 2026-07-06
+
+Armon: "let's do all that" — a green light to keep working the "make sure we have all Photoshop tools" checklist. Went straight for the highest-leverage item flagged in the previous entry: the selection-mask infrastructure, since it's the one piece that unlocks several tools at once rather than being one more one-off.
+
+### Design decision: keep the rect fast-path completely untouched
+
+`Renderer::selection_rect: Option<[f32;4]>` (the bounding box, driving the brush GPU scissor and Crop) is unchanged. A new `Renderer::selection_extra: Option<SelectionShape>` sits alongside it — `None` for the common case (`RectSelect`, deselect, select-all), so that path has zero new code running. `SelectionShape` is `Ellipse{cx,cy,rx,ry}` or `Polygon(Vec<[f32;2]>)`, all UV space. Deliberately **not** a standing canvas-sized mask buffer synced every frame — that would copy a full-resolution array 60 times a second for something that changes on the order of once per drag. Instead, `rasterize_selection_mask(width, height, shape)` runs on demand, exactly when Gradient or Move actually needs it (once per drag-release, not once per frame).
+
+### What shipped
+- **`SelectionShape`**, **`rasterize_selection_mask`** (antialiased ellipse via signed distance + smoothstep falloff; antialiased-free even-odd scanline polygon fill — both textbook CS graphics algorithms, clean-room), **`selection_shape_bounds`** (bounding box for the scissor/Crop fast path).
+- **`apply_gradient_fill`** and **`move_selection_pixels`** both gained an `Option<&[u8]>` mask parameter: gradient multiplies the source alpha by the mask's coverage at each texel; Move's cut-and-composite only touches texels where the mask is nonzero (a rect-bound pixel with mask=0 is left completely alone — not cleared, not moved). Both fall back to their exact pre-existing rect-only behaviour when `mask` is `None`, so RectSelect users see no change at all.
+- **`Tool::EllipseSelect`** ("Elps") — drag defines a bounding box; the ellipse is inscribed in it. **`Tool::Lasso`** ("Lso", hotkey **L** — Photoshop's real shortcut) — drag traces a freehand point path, implicitly closed on release. Both keep `select_rect` in sync as their bounding box throughout the drag (a bug caught and fixed before it shipped — see below), so the degenerate-selection cleanup and the scissor/crop fast paths work unmodified.
+- **Marching-ants generalized** from "always 4 rect corners" to an arbitrary closed point path: an ellipse traces as a 48-segment polygon approximation; a lasso traces its own recorded points. The perimeter used for the animated dash-marching phase is now the actual summed segment length, not a rect-only `2*(w+h)` shortcut.
+- **Move follows the shape**: after a Move, `Renderer::move_active_layer` shifts an active `SelectionShape`'s coordinates (an ellipse's centre, every polygon vertex) by the same UV delta as the pixels — Photoshop's marching ants track a moved selection the same way.
+
+### Bug caught and fixed before it shipped
+The Lasso cursor-move handler initially only appended to `lasso_points` and set `select_extra` — it never updated `select_rect`. Since `select_rect` stayed frozen at the single-point degenerate rect from mouse-press, **every** Lasso selection would have been silently cancelled by the existing "degenerate selection" cleanup on release (which checks `select_rect`'s width/height). Fixed by keeping `select_rect` synced to `selection_shape_bounds(&shape)` throughout the drag, same as Ellipse. Caught during implementation, before any build/test — the kind of thing that's obvious once you trace the data flow but easy to miss when adding a new tool that reuses an existing cleanup path.
+
+### Testing
+6 new pure-function tests (ellipse centre/corner selection, independent x/y radii — proving no accidental aspect-correction the way a round brush dab needs, a triangle polygon fill, bounding-box computation for both shapes, and a gradient-respects-exact-mask test that specifically checks a bounding-rect corner *outside* the ellipse stays untouched — the test that would have caught it if masking silently fell back to rect-only behaviour). 83 workspace tests green.
+
+### Scope cut, stated plainly
+**Brush painting is not yet mask-aware.** Painting inside an Ellipse/Lasso selection today is still bounded only by the selection's bounding-rect GPU scissor, same as before this entry — the exact shape is respected by Gradient and Move, not yet by the brush. Making Paint respect the exact shape needs either a bind-group/shader change to the brush pipeline (touches every stroke in the app) or a stroke-end CPU blend against the existing `pre_stroke` snapshot texture — deliberately deferred as its own tracked item (S1b in ROADMAP.md) rather than rushed into the shared brush pipeline under time pressure. Also not done this pass: Quick Selection (retargeting Magic Wand to produce a mask instead of directly flood-filling) and feathering (blurring the mask edge) — both real, both next.
+
+### Verification gap continues
+Screen Recording access flickered available again mid-session (`request_access` succeeded with no "another session" error) but the actual capture still returned the same byte-identical black frame as every prior attempt this session — confirms the block is at the OS capture layer, not the session-lock layer I'd been assuming. Relied on the automated suite once more; the geometric-correctness tests above (independent radii, mask-vs-bbox, shape tracking) are deliberately the closest a unit test can get to "did this actually draw right" without eyes on the screen.
+
+Next: masked brush painting (S1b) or Quick Selection retargeting, then M4's remaining items (text tool, free transform), then layer masks (S3).
