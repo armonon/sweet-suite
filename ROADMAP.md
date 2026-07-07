@@ -27,7 +27,7 @@ These are table-stakes; their absence is the first thing a Photoshop user notice
 | M5b | **Sparse/huge canvas via `TileCanvas`** | Split out of M5 — genuinely separate scope (sparse allocation, cross-tile brush stamping, compositor changes) from "not forced square". | L | `platform/gpu/src/tile_canvas.rs` already exists and is tested in isolation; wire it in as the main per-layer surface once there's a concrete need for canvases beyond ~4K². |
 | M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | L | Font-file **byte parsing** (pure format decode) is fine to depend on; hand-build the layout/kerning/rasterization on top ourselves. Start: single-line Latin, font/size/color, rasterize to active layer — defer full Unicode shaping/bidi/complex scripts. |
 | M4b | ~~**Crop**~~ **DONE 2026-07-06** | Trivially expected; unblocked by M5's canvas-resize machinery. | S | Shipped: `Renderer::crop_to_rect` reuses M3's rect selection as the crop source + M5's drain-and-recreate pattern. "Crop to Selection" in the RectSelect inspector. See DECISIONS.md. |
-| M4c | **Free transform** (scale/rotate/skew of layer or selection) | Only flip/rotate-90 exists today. | M | Affine warp of the layer's pixels + a handle gizmo. |
+| M4c | ~~**Free transform**~~ **DONE (scale + rotate) 2026-07-07** | Only flip/rotate-90 existed before this. | M | Shipped: `Tool::FreeTransform` ("Xfrm", **T**) — 4 corner handles (uniform scale, anchored at the opposite corner) + 1 rotate handle (about the box center), selection-aware like Move. `apply_free_transform` (pure fn, nearest-neighbor sampling — bilinear deferred, see DECISIONS.md). Each drag commits as its own undo step (no multi-parameter staging session like Photoshop's real Free Transform — a deliberate v1 scope cut). **Not done:** skew, and drag-inside-box-to-translate (use Move for that). |
 | M4d | ~~**Move (2D)**~~ **DONE 2026-07-06** | Photoshop's most-used tool had no SWEET equivalent. | S–M | Shipped: `Tool::MoveLayer` ("MovL", **V**), commit-on-release like Gradient. Selection-aware: with a selection active, only that region moves (leaving a transparent hole); with none, the whole layer shifts. See DECISIONS.md. |
 
 ## Tier 1 — selections & non-destructive editing (do next)
@@ -72,8 +72,8 @@ multires/dyntopo sculpting. Revisit only if a concrete user need pulls them in.
 ## Sequencing summary
 
 ```
-Tier 0  (floor)      → M5 canvas (done) · crop (done) · text · free-transform · M5b sparse canvas
-Tier 1  (selections) → mask texture → lasso/poly/wand/feather → layer masks
+Tier 0  (floor)      → M5 canvas (done) · crop (done) · free-transform (done) · text · M5b sparse canvas
+Tier 1  (selections) → mask texture (done) → lasso/poly (done) → wand→selection (done) → feather/layer masks
 Tier 2  (3D interop) → glTF/OBJ I/O → PBR material → UV unwrap
 Tier 3  (unified)    → depth/color passes → render-to-layer → local AI bridge
 ```
@@ -121,7 +121,7 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 | Path/Shape Selection | N/A without vector paths | — |
 | Shape tools (rect/ellipse/polygon/line/custom) | ⬜ as vector layers — SWEET's Add-Cube/Sphere/etc are 3D primitives, not 2D vector shapes | Large |
 | Hand / Zoom / Rotate View | 🟡 — arrow-key orbit + ±zoom (3D camera) covers the 3D case; no dedicated 2D pan/zoom-drag tool | Small |
-| Free Transform | ⬜ | M4c (tracked, effort M) |
+| Free Transform | ✅ `Tool::FreeTransform` (M4c, 2026-07-07) — scale + rotate; skew not done | — |
 | FG/BG color swatches + swap | ⬜ — one brush colour, no background swatch | Small |
 | Quick Mask mode | ⬜ | Tier 1, once S1 lands |
 

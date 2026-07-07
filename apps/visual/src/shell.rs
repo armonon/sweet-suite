@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use suite_doc::{Document, ObjId, ObjectKind};
 
-use crate::tools::Tool;
+use crate::tools::{Tool, TransformMode};
 
 /// A file-menu intent set by a top-bar button or a shortcut. The shell only *records*
 /// the intent; `main.rs` drains it after the egui frame and runs the (blocking) native
@@ -108,6 +108,15 @@ pub struct ShellState {
     /// Live Move-tool guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
     /// before each frame so the overlay can draw the drag line.
     pub move_preview: Option<[f32; 4]>,
+    /// Free Transform (M4c): which handle is being dragged, synced from `InputState` before
+    /// each frame — the overlay draws the box + handles whenever the tool is active, and the
+    /// live transformed-box preview additionally whenever this is `Some`.
+    pub transform_mode: Option<TransformMode>,
+    /// Live scale factor / rotation delta (radians) for the Free Transform overlay preview,
+    /// synced from `InputState` before each frame. Meaningless while `transform_mode` is
+    /// `None` (not read in that case).
+    pub transform_scale: f32,
+    pub transform_rotation: f32,
     /// Set by the inspector flip/180° buttons; drained in main.rs to call the renderer.
     /// Always dimension-preserving — safe regardless of canvas aspect ratio (M5).
     pub pending_layer_transform: Option<suite_gpu::LayerTransform>,
@@ -161,6 +170,9 @@ impl Default for ShellState {
             gradient_radial: false,
             gradient_preview: None,
             move_preview: None,
+            transform_mode: None,
+            transform_scale: 1.0,
+            transform_rotation: 0.0,
             pending_layer_transform: None,
             pending_canvas_rotate: None,
             pending_crop: None,
@@ -408,6 +420,7 @@ pub fn draw_shell(
                     (Tool::Lasso, "Lso", "L"),
                     (Tool::Gradient, "Grd", "G"),
                     (Tool::MoveLayer, "MovL", "V"),
+                    (Tool::FreeTransform, "Xfrm", "T"),
                     (Tool::AddCube, "Cub", "3"),
                     (Tool::AddSphere, "Sph", "4"),
                     (Tool::AddImage, "Img", "5"),
@@ -444,7 +457,8 @@ pub fn draw_shell(
                         match tool {
                             Tool::Select | Tool::Translate | Tool::Paint
                             | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
-                            | Tool::Gradient | Tool::MoveLayer | Tool::Eyedropper => {
+                            | Tool::Gradient | Tool::MoveLayer | Tool::FreeTransform
+                            | Tool::Eyedropper => {
                                 state.tool = tool
                             }
                             Tool::AddCube => {
@@ -778,6 +792,28 @@ pub fn draw_shell(
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Drag on the canvas: fills the active layer from the brush colour to transparent. Linear follows the drag direction; radial centres on the start point. Respects the active selection. ⌘Z undoes.")
+                        .color(TEXT_2)
+                        .small(),
+                );
+                ui.add_space(12.0);
+            }
+
+            if state.tool == Tool::FreeTransform {
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Free Transform").color(TEXT_0).strong());
+                ui.add_space(6.0);
+                let box_label = if state.selection_rect.is_some() { "the selection" } else { "the whole layer" };
+                ui.label(
+                    RichText::new(format!(
+                        "Drag a corner square to scale {box_label} (anchored at the opposite corner); drag the circle above the box to rotate about its center. Each drag commits as its own step (⌘Z undoes it)."
+                    ))
+                    .color(TEXT_2)
+                    .small(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Nearest-neighbor sampling (not smoothed/bilinear yet) — scaled and rotated edges will look a little aliased.")
                         .color(TEXT_2)
                         .small(),
                 );
@@ -1543,5 +1579,54 @@ pub fn draw_shell(
         painter.circle_stroke(p0, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
         painter.circle_filled(p1, 4.0, egui::Color32::WHITE);
         painter.circle_stroke(p1, 4.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+    }
+
+    // Free Transform (M4c): the transform box + its handles, always visible while the tool
+    // is active (so there's something to grab), plus a live transformed-box preview while a
+    // handle is being dragged. No pixel resampling happens here — same commit-on-release
+    // shape as Gradient/Move above; this is pure guide-line feedback.
+    if state.tool == Tool::FreeTransform {
+        let rect = canvas_rect;
+        let to_screen = |u: f32, v: f32| egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height());
+        let [bx0, by0, bx1, by1] = state.selection_rect.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+        let corners_uv = [[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]];
+        let box_pts: Vec<egui::Pos2> = corners_uv.iter().chain(corners_uv.first()).map(|p| to_screen(p[0], p[1])).collect();
+        painter.add(egui::Shape::closed_line(box_pts.clone(), egui::Stroke::new(1.5, egui::Color32::from_gray(180))));
+        for p in &box_pts[..4] {
+            painter.rect_filled(egui::Rect::from_center_size(*p, egui::vec2(8.0, 8.0)), 1.0, egui::Color32::WHITE);
+            painter.rect_stroke(egui::Rect::from_center_size(*p, egui::vec2(8.0, 8.0)), 1.0, egui::Stroke::new(1.5, egui::Color32::BLACK), egui::StrokeKind::Outside);
+        }
+        let center_uv = [(bx0 + bx1) * 0.5, (by0 + by1) * 0.5];
+        let top_center = to_screen(center_uv[0], by0);
+        let rotate_handle = egui::pos2(top_center.x, top_center.y - 24.0);
+        painter.line_segment([top_center, rotate_handle], egui::Stroke::new(1.5, egui::Color32::from_gray(180)));
+        painter.circle_filled(rotate_handle, 5.0, egui::Color32::WHITE);
+        painter.circle_stroke(rotate_handle, 5.0, egui::Stroke::new(1.5, egui::Color32::BLACK));
+
+        // Live preview: forward-map the box's 4 corners through the in-progress scale/
+        // rotation (same formula as `apply_free_transform`'s corner-bbox step) and draw the
+        // result in accent color, so the user sees where release will land before committing.
+        if let Some(mode) = state.transform_mode {
+            let (pivot_u, pivot_v) = match mode {
+                TransformMode::Scale { anchor_uv } => (anchor_uv[0], anchor_uv[1]),
+                TransformMode::Rotate { center_uv, .. } => (center_uv[0], center_uv[1]),
+            };
+            let (cw, ch) = (rect.width().max(1.0), rect.height().max(1.0));
+            let pivot_px = (pivot_u * cw, pivot_v * ch);
+            let (sin_r, cos_r) = state.transform_rotation.sin_cos();
+            let scale = state.transform_scale;
+            let preview_pts: Vec<egui::Pos2> = corners_uv
+                .iter()
+                .chain(corners_uv.first())
+                .map(|p| {
+                    let (px, py) = (p[0] * cw, p[1] * ch);
+                    let (ox, oy) = (px - pivot_px.0, py - pivot_px.1);
+                    let (sx, sy) = (ox * scale, oy * scale);
+                    let (fx, fy) = (sx * cos_r - sy * sin_r + pivot_px.0, sx * sin_r + sy * cos_r + pivot_px.1);
+                    egui::pos2(rect.left() + fx, rect.top() + fy)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(preview_pts, egui::Stroke::new(2.0, ACCENT_HOVER)));
+        }
     }
 }

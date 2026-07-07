@@ -597,6 +597,30 @@ impl ApplicationHandler for App {
                             self.input.move_preview = None;
                             self.shell.move_preview = None;
                         }
+                        // Free Transform: commit the accumulated scale/rotation from the
+                        // recorded drag on release — same commit-on-release shape as Move.
+                        if self.shell.tool == tools::Tool::FreeTransform {
+                            if let Some(mode) = self.input.transform_mode {
+                                let scale = self.input.transform_scale;
+                                let rotation = self.input.transform_rotation;
+                                // Skip a click without a real drag (identity transform).
+                                if (scale - 1.0).abs() > 0.001 || rotation.abs() > 0.001 {
+                                    let pivot_uv = match mode {
+                                        tools::TransformMode::Scale { anchor_uv } => anchor_uv,
+                                        tools::TransformMode::Rotate { center_uv, .. } => center_uv,
+                                    };
+                                    renderer.free_transform_active_layer(pivot_uv, scale, rotation);
+                                    self.undo_order.push(UndoKind::Paint);
+                                    self.redo_order.clear();
+                                    self.shell.dirty = true;
+                                }
+                            }
+                            self.input.transform_mode = None;
+                            self.input.transform_scale = 1.0;
+                            self.input.transform_rotation = 0.0;
+                            self.input.transform_drag_start = None;
+                            self.shell.transform_mode = None;
+                        }
                         // Inlined end_canvas_edit (disjoint fields; `renderer` is borrowed).
                         if self.canvas_edit_active {
                             let committed = self.document.commit();
@@ -731,6 +755,10 @@ impl ApplicationHandler for App {
                     }
                     KeyCode::KeyW => {
                         self.shell.tool = tools::Tool::MagicWand;
+                        window.request_redraw();
+                    }
+                    KeyCode::KeyT => {
+                        self.shell.tool = tools::Tool::FreeTransform;
                         window.request_redraw();
                     }
                     KeyCode::Digit3 => {
@@ -944,6 +972,11 @@ impl ApplicationHandler for App {
                 self.shell.gradient_preview = self.input.gradient_preview;
                 // Move guide line: same sync.
                 self.shell.move_preview = self.input.move_preview;
+                // Free Transform (M4c): same sync — read-only from the overlay/inspector's
+                // point of view, so input → shell is the only direction needed.
+                self.shell.transform_mode = self.input.transform_mode;
+                self.shell.transform_scale = self.input.transform_scale;
+                self.shell.transform_rotation = self.input.transform_rotation;
 
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let full_output = self.egui_context.run_ui(raw_input, |ui| {

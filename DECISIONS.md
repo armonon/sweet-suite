@@ -1430,3 +1430,40 @@ The marching-ants overlay for a Mask selection still draws its bounding-box rect
 Verification gap continues (Screen Recording still blocked at the OS capture layer this session) — same substitution as every prior entry: the automated suite, plus in this case extra care taken specifically *because* of the gap (declining to ship the contour-trace geometry code without being able to see it work).
 
 Next: layer masks (S3, direct reuse of the S1 mask machinery) or M4's remaining items (text tool, free transform).
+
+---
+
+## Tier 1 S3 (layer masks): deferred, not skipped — 2026-07-07
+
+Before picking the next item off my own list, I looked hard at layer masks (S3) since it was the natural next step and ROADMAP.md already estimated it at effort M ("direct reuse of the S1 mask machinery"). Worth recording why I didn't build it this session, since the ROADMAP entry alone wouldn't explain the reasoning.
+
+A layer mask needs to affect the shared **compositor**, not a single tool's own code path. Every layer composite goes through one `wgpu` bind group + WGSL shader (`LAYER_COMPOSITE_WGSL`, `layer_composite_layout`, `record_composite`) with exactly 4 bindings (base texture, source texture, sampler, blend-params uniform) — that pipeline runs for every layer, on every recomposite, and `layers_dirty` is set (and consumed) on **every single brush stamp**, not just on stroke-end. So there were really only two ways to add masking:
+
+1. **Extend the shared shader/bind-group** with a 5th (mask) texture binding, sampled and multiplied into source alpha. Correct and performant, but it touches the one pipeline every layer in the app depends on, on every frame of every drag. A subtly wrong bind-group layout or default-mask value would break rendering app-wide, not just masking — and I have no way to watch it render this session (Screen Recording still blocked).
+2. **CPU pre-multiply before compositing** (readback a masked layer's pixels + mask, multiply alpha, reupload, composite normally) — avoids touching the shared shader at all, but since `layers_dirty`/full recomposite fires on every paint stamp, this would mean a blocking GPU→CPU readback (`device.poll(wait_indefinitely)`) on every frame of every stroke on any layer, as long as *any* layer in the document has a mask. That's a real, continuous frame-time regression, not a hypothetical — this app has its own stated `<8ms` frame-budget law (Phase 0), and this would blow through it.
+
+Every masked feature shipped this session so far (S1b, S2b, Move, Gradient) deliberately avoided touching pipelines shared by *every* stroke/composite — that's the same reasoning that picked a CPU stroke-end blend over a brush-shader change for S1b. Layer masks don't have an equivalent "isolated" path: the thing that needs to change (the compositor) is the shared thing. Given that and the standing verification gap, I'm deferring it rather than shipping a shader/bind-group change I can't see run, or a CPU path with a real, predictable performance cost. Picked up M4c (Free Transform) instead — well-scoped, follows the proven pure-function pattern, and doesn't touch any shared pipeline. Flagged in ROADMAP.md so this isn't silently dropped.
+
+---
+
+## M4c: Free Transform (scale + rotate) — 2026-07-07
+
+### What shipped
+`Tool::FreeTransform` ("Xfrm", **T**): a transform box (the active selection, or the whole canvas with none — same convention as Move) with 4 corner handles and 1 rotate handle. Dragging a corner uniformly scales the box anchored at the *opposite* corner (Photoshop's default, no-modifier behavior); dragging the handle above the box rotates about its center. Same commit-on-release shape as Gradient/Move: the overlay shows a live guide (the box + handles always, plus a forward-mapped preview quad while dragging), and the actual pixel warp happens once, on release, as a single undo step.
+
+Core math is `apply_free_transform` (pure fn, `platform/gpu/src/lib.rs`): forward-maps the region's corners to find the destination bbox to iterate, then for each destination pixel inverse-maps (undo rotation, undo scale, relative to the pivot) to find the nearest source texel, and composites it in linear space — same "cut a hole, paste back" shape and same composite math as `move_selection_pixels`, generalized from a plain shift to a full affine warp. Selection-aware and mask-aware the same way Move is: with a selection active, only that region transforms (leaving a transparent hole at the original spot); with none, the whole layer does (starting blank, since every destination pixel is re-sourced).
+
+**Deliberate v1 scope cuts, both documented rather than silently missing:**
+- **Nearest-neighbor sampling, not bilinear.** Bilinear would smooth scaled/rotated edges, but a subtly wrong resampling kernel (wrong weight, off-by-one in the 2x2 neighborhood) is exactly the kind of bug that needs eyes on a screen to catch with confidence, and this shipped during the same Screen Recording outage as S2b's contour-trace deferral. Nearest-neighbor's correctness is verifiable by construction with plain pixel-equality tests (see below) — the honest trade is aliased edges instead of smooth ones, stated in the tool's own inspector hint text, not hidden.
+- **One drag, one commit — no multi-parameter staging session.** Photoshop's real Free Transform lets you adjust scale AND rotation across several handle drags before a single Enter-to-apply. This version commits each individual drag immediately (matching how every other tool in the app already works), so combining scale + rotate takes two separate undo steps instead of one. Simpler state machine, consistent mental model with the rest of the app, at the cost of an extra undo step for compound transforms.
+- **No skew, no drag-inside-box-to-translate** — translation is already Move's job; skew wasn't built.
+
+### Bug caught by the test, before it shipped
+The first rotation test failed: I'd predicted a marker "2 texels above the pivot" would land 2 texels to its right after a +90° rotation, using a pivot at a grid *corner* (5.0, 5.0) and reasoning in whole-texel offsets. The code was right and my test's mental math was sloppy — the marker's texel *center* was actually (5.5, 3.5), an offset of (0.5, -1.5) from that corner-pivot, not the clean (0, -2) I'd assumed. Recomputed by hand (forward-mapping the actual texel center through the same rotation formula the code uses) and confirmed the code's output was correct; fixed the test to use a pivot that's itself a texel *center* (5.5, 5.5), which makes "2 texels above" an exact offset with no half-texel ambiguity. Worth recording because it's the inverse of most bugs caught this session: this time the implementation was right and the test's arithmetic was wrong — a reminder that a geometry test failing doesn't automatically mean the code is the thing that's broken.
+
+### Testing
+3 new CPU-only tests: scaling 2x about a corner moves a marker texel to the expected forward-mapped position (and spreads it across the 2x2 block nearest-neighbor now maps to it); a +90° rotation moves "above the pivot" to "right of the pivot" (confirmed as on-screen clockwise for positive angles in this y-down image convention — useful, since the UI's drag-angle computation depends on getting this sign right); a region-scoped transform leaves a transparent hole at the original spot once content shrinks away from it. 90 workspace tests green (up from 87).
+
+Verification gap continues (Screen Recording still blocked at the OS capture layer this session) — same substitution as every prior entry: the automated suite, plus the nearest-neighbor scope cut above taken specifically because of it.
+
+Next: M4a (text tool, effort L — clean-room font parsing + layout) is the last open Tier 0 item; Tier 1 S3 (layer masks) and Quick Selection feathering remain open pending either a compositor-shader change I can verify live, or a non-performance-regressing CPU path.

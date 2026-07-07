@@ -24,6 +24,7 @@ pub enum Tool {
     Lasso,
     Gradient,
     MoveLayer,
+    FreeTransform,
     AddCube,
     AddSphere,
     AddImage,
@@ -46,6 +47,7 @@ impl Tool {
             Self::Lasso => "Lasso",
             Self::Gradient => "Gradient",
             Self::MoveLayer => "Move Layer",
+            Self::FreeTransform => "Free Transform",
             Self::AddCube => "Add Cube",
             Self::AddSphere => "Add Sphere",
             Self::AddImage => "Add Image Plane",
@@ -67,6 +69,7 @@ impl Tool {
             Self::Lasso => "Drag a freehand outline; it closes back to the start on release. Gradient/Move respect the exact shape; Crop uses its bounding rect.",
             Self::Gradient => "Drag on the canvas to fill the active layer with a gradient from the brush colour to transparent (or pick endpoints in the inspector). Linear or radial. Respects the active selection. G to activate.",
             Self::MoveLayer => "Drag on the canvas to move the active layer's pixels. With an active selection, only the selected pixels move (leaving a transparent hole). V to activate.",
+            Self::FreeTransform => "Drag a corner handle to scale (anchored at the opposite corner) or the handle above the box to rotate. Selection-aware like Move. Each drag commits as its own undo step on release. T to activate.",
             Self::AddCube => "Adds a unit cube where you click and selects it.",
             Self::AddSphere => "Adds a unit sphere where you click and selects it.",
             Self::AddImage => "Adds a textured image plane where you click and selects it.",
@@ -157,6 +160,31 @@ pub struct InputState {
     /// Live move endpoints `[u0, v0, u1, v1]` in UV space while dragging — drawn as a guide
     /// line in the overlay. Cleared on release after the move commits.
     pub move_preview: Option<[f32; 4]>,
+    /// Free Transform (M4c): which handle the current drag grabbed, and the fixed point
+    /// (UV) that stays put while dragging it — `None` while idle or when the press missed
+    /// every handle (a no-op drag).
+    pub transform_mode: Option<TransformMode>,
+    /// Screen-space cursor position at press time (Scale mode measures distance-from-anchor
+    /// growth relative to this, rather than an absolute drag start).
+    pub transform_drag_start: Option<(f32, f32)>,
+    /// Live scale factor accumulated during a `Scale` drag (1.0 = identity, i.e. no drag yet).
+    pub transform_scale: f32,
+    /// Live rotation delta (radians) accumulated during a `Rotate` drag (0.0 = identity).
+    pub transform_rotation: f32,
+}
+
+/// Free Transform (M4c): which part of the transform box the current drag is driving. The
+/// box itself is `shell.selection_rect.unwrap_or([0,0,1,1])` — the active selection, or the
+/// whole canvas with none — so there's no separate "transform box" state to keep in sync.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformMode {
+    /// Dragging a corner handle: uniform scale anchored at the *opposite* corner (UV),
+    /// which is Photoshop's default (no modifier held) anchor behavior.
+    Scale { anchor_uv: [f32; 2] },
+    /// Dragging the rotate handle: rotate about the box's center (UV). `start_angle` is the
+    /// cursor's angle (screen space, atan2 convention) relative to the center at press time,
+    /// so the live delta is always `current_angle - start_angle`.
+    Rotate { center_uv: [f32; 2], start_angle: f32 },
 }
 
 /// Krita-referenced symmetry painting: given a brush segment in UV space, return the
@@ -516,6 +544,38 @@ pub fn handle_cursor_moved(
         return;
     }
 
+    // Held drag — Free Transform: update the live scale factor / rotation delta from
+    // whichever handle `handle_left_press` locked onto. Same commit-on-release shape as
+    // Move/Gradient — only the overlay's transformed-box preview moves during the drag; the
+    // actual pixel warp happens once, in `main.rs`, on release.
+    if shell.tool == Tool::FreeTransform && input.left_pressed {
+        if let Some(mode) = input.transform_mode {
+            let (l, t, r, b) = shell.canvas_rect(renderer.size());
+            let (cw, ch) = ((r - l).max(1.0), (b - t).max(1.0));
+            let to_screen = |u: f32, v: f32| (l + u * cw, t + v * ch);
+            let (px, py) = input.cursor;
+            match mode {
+                TransformMode::Scale { anchor_uv } => {
+                    let (ax, ay) = to_screen(anchor_uv[0], anchor_uv[1]);
+                    // Distance from the anchor at press time vs. now — their ratio is the
+                    // live scale factor. `.max(1.0)` avoids a division blowup right at the
+                    // anchor (a near-zero start distance would otherwise make tiny cursor
+                    // moves swing the scale wildly).
+                    let (sx, sy) = input.transform_drag_start.unwrap_or((px, py));
+                    let d0 = ((sx - ax).powi(2) + (sy - ay).powi(2)).sqrt().max(1.0);
+                    let d1 = ((px - ax).powi(2) + (py - ay).powi(2)).sqrt().max(1.0);
+                    input.transform_scale = (d1 / d0).clamp(0.05, 20.0);
+                }
+                TransformMode::Rotate { center_uv, start_angle } => {
+                    let (ccx, ccy) = to_screen(center_uv[0], center_uv[1]);
+                    let angle = (py - ccy).atan2(px - ccx);
+                    input.transform_rotation = angle - start_angle;
+                }
+            }
+        }
+        return;
+    }
+
     // Held drag — Paint: stamp from the last UV to the current one so fast strokes
     // stay continuous. Stabilizer smooths the cursor. Canvas path first, then mesh.
     if shell.tool == Tool::Paint {
@@ -736,6 +796,35 @@ pub fn handle_left_press(
             let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
             input.move_drag_start = Some([u, v]);
             input.move_preview = Some([u, v, u, v]);
+        }
+        Tool::FreeTransform => {
+            // The transform box is the active selection, or the whole canvas with none —
+            // same convention Move already uses for "selection vs whole layer".
+            let [bx0, by0, bx1, by1] = shell.selection_rect.unwrap_or([0.0, 0.0, 1.0, 1.0]);
+            let (l, t, r, b) = canvas;
+            let (cw, ch) = ((r - l).max(1.0), (b - t).max(1.0));
+            let to_screen = |u: f32, v: f32| (l + u * cw, t + v * ch);
+            let center_uv = [(bx0 + bx1) * 0.5, (by0 + by1) * 0.5];
+            let (ccx, ccy) = to_screen(center_uv[0], center_uv[1]);
+            let (tcx, tcy) = to_screen(center_uv[0], by0);
+            let rotate_handle = (tcx, tcy - 24.0);
+            let corners_uv = [[bx0, by0], [bx1, by0], [bx0, by1], [bx1, by1]];
+            let opposite_uv = [[bx1, by1], [bx0, by1], [bx1, by0], [bx0, by0]];
+            let (px, py) = input.cursor;
+            let near = |hx: f32, hy: f32| ((px - hx).powi(2) + (py - hy).powi(2)).sqrt() < 10.0;
+
+            input.transform_mode = if near(rotate_handle.0, rotate_handle.1) {
+                let start_angle = (py - ccy).atan2(px - ccx);
+                Some(TransformMode::Rotate { center_uv, start_angle })
+            } else {
+                (0..4).find_map(|i| {
+                    let (hx, hy) = to_screen(corners_uv[i][0], corners_uv[i][1]);
+                    near(hx, hy).then_some(TransformMode::Scale { anchor_uv: opposite_uv[i] })
+                })
+            };
+            input.transform_scale = 1.0;
+            input.transform_rotation = 0.0;
+            input.transform_drag_start = Some(input.cursor);
         }
         Tool::Paint => {
             // Stamp a single dab where the press landed; the drag continues the stroke.

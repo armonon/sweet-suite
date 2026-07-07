@@ -660,6 +660,124 @@ pub fn move_selection_pixels(
     dst
 }
 
+/// **Pure** free transform (M4c): uniform scale then rotation about a fixed `pivot` texel,
+/// applied to `region` (texel `(x0, y0, w, h)`, or `None` for the whole layer) and
+/// composited back — same "cut a hole, paste back" shape as `move_selection_pixels`, but
+/// with an inverse-mapped affine warp instead of a plain shift. Nearest-neighbor sampling
+/// (not bilinear): a deliberate scope cut for v1 — bilinear would smooth scaled/rotated
+/// edges, but a subtly wrong resampling kernel is exactly the kind of bug that needs eyes
+/// on a screen to catch, and this shipped during a session-long Screen Recording outage
+/// (see DECISIONS.md). Nearest-neighbor's correctness is easy to verify by construction and
+/// with plain pixel-equality tests, at the cost of aliased (not smoothed) transformed edges.
+/// `region.is_some()` leaves a transparent hole at the original spot (like Move); `None`
+/// (whole layer) starts from blank since every destination pixel is re-sourced by the warp.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_free_transform(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    region: Option<(usize, usize, usize, usize)>,
+    pivot: (f32, f32),
+    scale: f32,
+    rotation: f32,
+    mask: Option<&[u8]>,
+) -> Vec<u8> {
+    let (rx0, ry0, rw, rh) = region.unwrap_or((0, 0, width, height));
+    let (rx1, ry1) = (rx0 + rw, ry0 + rh);
+    let mask_at = |x: usize, y: usize| -> f32 {
+        match mask {
+            Some(m) => m[y * width + x] as f32 / 255.0,
+            None => 1.0,
+        }
+    };
+
+    let mut dst = if region.is_some() {
+        let mut d = src.to_vec();
+        for y in ry0..ry1.min(height) {
+            for x in rx0..rx1.min(width) {
+                let cov = mask_at(x, y);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let idx = (y * width + x) * 4;
+                d[idx + 3] = (d[idx + 3] as f32 * (1.0 - cov)).round() as u8;
+            }
+        }
+        d
+    } else {
+        vec![0u8; src.len()]
+    };
+
+    let scale = if scale.abs() > 1e-6 { scale } else { 1e-6 };
+    let (sin_r, cos_r) = rotation.sin_cos();
+
+    // Forward-map the region's 4 corners to find the destination bbox to iterate — cheaper
+    // than scanning the whole canvas, and correct for any scale/rotation combination.
+    let corners = [
+        (rx0 as f32, ry0 as f32),
+        (rx1 as f32, ry0 as f32),
+        (rx0 as f32, ry1 as f32),
+        (rx1 as f32, ry1 as f32),
+    ];
+    let (mut dx0, mut dy0, mut dx1, mut dy1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (cx, cy) in corners {
+        let (ox, oy) = (cx - pivot.0, cy - pivot.1);
+        let (sx, sy) = (ox * scale, oy * scale);
+        let (fx, fy) = (sx * cos_r - sy * sin_r + pivot.0, sx * sin_r + sy * cos_r + pivot.1);
+        dx0 = dx0.min(fx);
+        dy0 = dy0.min(fy);
+        dx1 = dx1.max(fx);
+        dy1 = dy1.max(fy);
+    }
+    let bx0 = (dx0.floor().max(0.0) as usize).min(width);
+    let by0 = (dy0.floor().max(0.0) as usize).min(height);
+    let bx1 = (dx1.ceil().max(0.0) as usize).min(width);
+    let by1 = (dy1.ceil().max(0.0) as usize).min(height);
+
+    for y in by0..by1 {
+        for x in bx0..bx1 {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            // Inverse map: undo rotation then scale, relative to the pivot.
+            let (ox, oy) = (px - pivot.0, py - pivot.1);
+            let (rxp, ryp) = (ox * cos_r + oy * sin_r, -ox * sin_r + oy * cos_r);
+            let (srcx, srcy) = (rxp / scale + pivot.0, ryp / scale + pivot.1);
+            if srcx < rx0 as f32 || srcx >= rx1 as f32 || srcy < ry0 as f32 || srcy >= ry1 as f32 {
+                continue;
+            }
+            let (sxi, syi) = (srcx as usize, srcy as usize);
+            let cov = mask_at(sxi, syi);
+            let si = (syi * width + sxi) * 4;
+            let sa = (src[si + 3] as f32 / 255.0) * cov;
+            if sa <= 0.0 {
+                continue;
+            }
+            let sr = srgb_to_linear(src[si] as f32 / 255.0);
+            let sg = srgb_to_linear(src[si + 1] as f32 / 255.0);
+            let sb = srgb_to_linear(src[si + 2] as f32 / 255.0);
+            let di = (y * width + x) * 4;
+            let da = dst[di + 3] as f32 / 255.0;
+            let dr = srgb_to_linear(dst[di] as f32 / 255.0);
+            let dg = srgb_to_linear(dst[di + 1] as f32 / 255.0);
+            let db = srgb_to_linear(dst[di + 2] as f32 / 255.0);
+            let oa = sa + da * (1.0 - sa);
+            let (or_, og, ob) = if oa > 1e-6 {
+                (
+                    (sr * sa + dr * da * (1.0 - sa)) / oa,
+                    (sg * sa + dg * da * (1.0 - sa)) / oa,
+                    (sb * sa + db * da * (1.0 - sa)) / oa,
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            dst[di] = (linear_to_srgb(or_).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 1] = (linear_to_srgb(og).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 2] = (linear_to_srgb(ob).clamp(0.0, 1.0) * 255.0).round() as u8;
+            dst[di + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    dst
+}
+
 /// Drives the translate-gizmo draw. The renderer reads this once per frame; nothing is
 /// retained across frames.
 #[derive(Clone, Copy, Debug)]
@@ -2221,6 +2339,35 @@ impl Renderer {
         new_selection_uv
     }
 
+    /// **M4c: Free Transform.** Uniform scale then rotate the active layer's pixels about
+    /// `pivot_uv`, selection-aware like Move (only the selected region moves, leaving a
+    /// transparent hole, when a selection is active). `pivot_uv`/`scale`/`rotation` are
+    /// supplied by the caller (`tools.rs`), derived from whichever drag handle the user
+    /// grabbed — a corner scales anchored at the opposite corner; the rotate handle rotates
+    /// about the box's center. Thin GPU-readback/write wrapper around the pure
+    /// `apply_free_transform`. A single commit, same shape as `move_active_layer`.
+    pub fn free_transform_active_layer(&mut self, pivot_uv: [f32; 2], scale: f32, rotation: f32) {
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
+        let src = self.read_active_layer_rgba();
+        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let region = self.selection_rect.and_then(|[x0, y0, x1, y1]| {
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            let sx0 = ((x0 * w as f32).floor() as usize).min(w.saturating_sub(1));
+            let sy0 = ((y0 * h as f32).floor() as usize).min(h.saturating_sub(1));
+            let sw = (((x1 * w as f32).ceil() as usize).saturating_sub(sx0)).max(1);
+            let sh = (((y1 * h as f32).ceil() as usize).saturating_sub(sy0)).max(1);
+            Some((sx0, sy0, sw, sh))
+        });
+        let pivot = (pivot_uv[0] * w as f32, pivot_uv[1] * h as f32);
+        let dst = apply_free_transform(&src, w, h, region, pivot, scale, rotation, mask.as_deref());
+        self.write_active_layer_undoable(&dst);
+    }
+
     /// **M4: Crop.** Crop the whole document to the UV-space rect `[x0, y0, x1, y1]` (every
     /// layer + the comp/display buffers together, so they stay aligned — same reasoning as
     /// `rotate_canvas_90`). Not undoable (a structural resize). No-op if the rect is
@@ -3327,7 +3474,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_gradient_fill, apply_layer_transform, crop_pixels, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
+    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, crop_pixels, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -3467,6 +3614,58 @@ mod m4_tests {
         assert_eq!(px(&out, w, 6, 3)[0], 255, "moved content lands at the new spot");
         // Untouched background elsewhere is still opaque black.
         assert_eq!(px(&out, w, 0, 0), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn free_transform_scale_moves_content_away_from_the_pivot() {
+        let (w, h) = (8, 8);
+        let mut buf = vec![0u8; w * h * 4];
+        let src_idx = (1 * w + 1) * 4;
+        buf[src_idx..src_idx + 4].copy_from_slice(&[255, 0, 0, 255]);
+        // Scale 2x about the origin (top-left corner) — the whole layer (region=None), so
+        // the original spot is NOT carried over untouched (everything is re-sourced).
+        let out = apply_free_transform(&buf, w, h, None, (0.0, 0.0), 2.0, 0.0, None);
+        assert_eq!(out[src_idx + 3], 0, "the untransformed layer should not show through");
+        // Forward-mapping (1,1) about pivot (0,0) at scale 2 lands at (2,2) — nearest-
+        // neighbor sampling spreads that one source texel across the 2x2 block it now covers.
+        for &(x, y) in &[(2, 2), (2, 3), (3, 2), (3, 3)] {
+            let p = (y * w + x) * 4;
+            assert_eq!(&out[p..p + 3], &[255, 0, 0], "expected red at ({x},{y}), got {:?}", &out[p..p + 3]);
+        }
+    }
+
+    #[test]
+    fn free_transform_positive_rotation_is_on_screen_clockwise() {
+        let (w, h) = (10, 10);
+        let mut buf = vec![0u8; w * h * 4];
+        // Pivot at (5.5, 5.5) — deliberately a texel *center* (not a grid corner) so "2
+        // texels above" is an exact offset, not an approximation across a half-texel seam.
+        // Marker 2 texels above the pivot (image y increases downward, so "above" = smaller y).
+        let src_idx = (3 * w + 5) * 4;
+        buf[src_idx..src_idx + 4].copy_from_slice(&[0, 255, 0, 255]);
+        let out = apply_free_transform(&buf, w, h, None, (5.5, 5.5), 1.0, std::f32::consts::FRAC_PI_2, None);
+        // A +90 degree rotation in this image-space convention moves "above the pivot" to
+        // "right of the pivot" — on-screen clockwise (12 o'clock -> 3 o'clock).
+        let dst_idx = (5 * w + 7) * 4;
+        assert_eq!(&out[dst_idx..dst_idx + 3], &[0, 255, 0], "up should rotate to the right (clockwise)");
+    }
+
+    #[test]
+    fn free_transform_with_a_region_leaves_a_transparent_hole_at_the_original_spot() {
+        let (w, h) = (12, 12);
+        let mut buf = vec![0u8; w * h * 4];
+        for y in 4..8 {
+            for x in 4..8 {
+                let p = (y * w + x) * 4;
+                buf[p..p + 4].copy_from_slice(&[0, 0, 255, 255]);
+            }
+        }
+        // Shrink the 4x4 blue region to half size about its own center (6,6) — the far
+        // corner of the original footprint should end up outside the shrunk content.
+        let region = Some((4usize, 4usize, 4usize, 4usize));
+        let out = apply_free_transform(&buf, w, h, region, (6.0, 6.0), 0.5, 0.0, None);
+        let corner = (4 * w + 4) * 4;
+        assert_eq!(out[corner + 3], 0, "original region corner should be cleared, got {:?}", &out[corner..corner + 4]);
     }
 
     // ----- Tier 1: selection mask (Ellipse / Lasso) -------------------------------------
