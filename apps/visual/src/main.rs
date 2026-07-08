@@ -991,6 +991,9 @@ impl ApplicationHandler for App {
                 // Tier 1: same sync for the exact shape (Ellipse/Lasso), when present.
                 self.shell.selection_extra = self.input.select_extra.clone();
                 renderer.selection_extra = self.shell.selection_extra.clone();
+                // Tier 1: feather radius is inspector-owned → push it to the renderer, which
+                // applies it when it rasterizes the selection mask.
+                renderer.selection_feather = self.shell.selection_feather;
                 // Gradient guide line: input → shell so the overlay can draw the drag.
                 self.shell.gradient_preview = self.input.gradient_preview;
                 // Move guide line: same sync.

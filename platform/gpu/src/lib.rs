@@ -342,6 +342,65 @@ pub fn selection_shape_bounds(shape: &SelectionShape) -> [f32; 4] {
     }
 }
 
+/// Separable single-channel box blur (horizontal then vertical), edge-clamped, sliding-window
+/// O(width·height) regardless of `radius`. Helper for `feather_mask`; edge clamping (not
+/// zero-padding) is deliberate so a selection touching the canvas border doesn't get a
+/// spurious dark fringe there.
+fn box_blur_1ch(src: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    let window = (2 * radius + 1) as u32;
+    let (w, h) = (width as isize, height as isize);
+
+    // Horizontal pass: src -> tmp.
+    let mut tmp = vec![0u8; src.len()];
+    for y in 0..height {
+        let row = y * width;
+        let r = radius as isize;
+        let mut sum: u32 = 0;
+        for k in -r..=r {
+            sum += src[row + k.clamp(0, w - 1) as usize] as u32;
+        }
+        for x in 0..width {
+            tmp[row + x] = (sum / window) as u8;
+            let remove = (x as isize - r).clamp(0, w - 1) as usize;
+            let add = (x as isize + r + 1).clamp(0, w - 1) as usize;
+            sum = sum - src[row + remove] as u32 + src[row + add] as u32;
+        }
+    }
+
+    // Vertical pass: tmp -> dst.
+    let mut dst = vec![0u8; src.len()];
+    for x in 0..width {
+        let r = radius as isize;
+        let mut sum: u32 = 0;
+        for k in -r..=r {
+            sum += tmp[k.clamp(0, h - 1) as usize * width + x] as u32;
+        }
+        for y in 0..height {
+            dst[y * width + x] = (sum / window) as u8;
+            let remove = (y as isize - r).clamp(0, h - 1) as usize;
+            let add = (y as isize + r + 1).clamp(0, h - 1) as usize;
+            sum = sum - tmp[remove * width + x] as u32 + tmp[add * width + x] as u32;
+        }
+    }
+    dst
+}
+
+/// **Pure**: soften a coverage mask's edges (selection *feathering*). Runs `box_blur_1ch`
+/// twice — a tent filter, which gives a smoother, more Gaussian-looking falloff than a single
+/// box pass while staying linear-time. `radius == 0` returns the mask unchanged, byte-for-byte
+/// (the hard-edge default). Used so Paint/Gradient/Move/Text fade out gradually across a
+/// selection boundary instead of a hard cut. Note this softens the mask *in place over the
+/// canvas*; a tool that only visits the selection's bounding box sees the interior half of the
+/// falloff (an inset-style feather), which is the intended, documented v1 behavior — the
+/// selection's extent/scissor is not widened.
+pub fn feather_mask(mask: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    if radius == 0 || width == 0 || height == 0 {
+        return mask.to_vec();
+    }
+    let once = box_blur_1ch(mask, width, height, radius);
+    box_blur_1ch(&once, width, height, radius)
+}
+
 // sRGB <-> linear transfer (the paint texture is `Rgba8UnormSrgb`, so direct CPU pixel
 // edits must encode/decode to composite correctly in linear space).
 #[inline]
@@ -1090,6 +1149,11 @@ pub struct Renderer {
     /// bounding-rect scissor for now (masked *painting* is a tracked follow-up — see
     /// ROADMAP.md Tier 1).
     pub selection_extra: Option<SelectionShape>,
+    /// Tier 1: feather radius in **texels**. `0.0` = a hard selection edge (the default, and
+    /// byte-for-byte the pre-feather behavior). When > 0, `current_selection_mask` softens the
+    /// rasterized mask's edge by this much before any tool applies it. Kept in sync from the
+    /// shell's inspector slider.
+    pub selection_feather: f32,
 }
 
 impl Renderer {
@@ -1589,6 +1653,7 @@ impl Renderer {
             skeleton_segments: Vec::new(),
             selection_rect: None,
             selection_extra: None,
+            selection_feather: 0.0,
         }
     }
 
@@ -1733,6 +1798,19 @@ impl Renderer {
         self.queue.submit(Some(enc.finish()));
     }
 
+    /// Tier 1: the active selection's exact per-texel coverage mask (full canvas, `w`×`h`),
+    /// or `None` when there's no exact shape (plain `RectSelect`, or no selection at all — the
+    /// common case, where the rect scissor already does the clipping). Rasterizes
+    /// `selection_extra` and, when `selection_feather > 0`, softens its edge — the single place
+    /// feathering is applied, so every tool (Paint/Gradient/Move/Text) picks it up uniformly.
+    fn current_selection_mask(&self, w: usize, h: usize) -> Option<Vec<u8>> {
+        self.selection_extra.as_ref().map(|shape| {
+            let mask = rasterize_selection_mask(w, h, shape);
+            let r = self.selection_feather.round().max(0.0) as usize;
+            if r > 0 { feather_mask(&mask, w, h, r) } else { mask }
+        })
+    }
+
     /// Finish the current paint stroke — commits its undo entry. Call on mouse-up.
     pub fn paint_end_stroke(&mut self) {
         let mut enc = self
@@ -1743,13 +1821,12 @@ impl Renderer {
         // Tier 1 (S1b): an exact-shape selection (Ellipse/Lasso) masks the just-finished
         // stroke against its precise boundary — the GPU scissor during painting only
         // constrained dabs to the selection's bounding box.
-        match &self.selection_extra {
-            Some(shape) => {
-                let (w, h) = {
-                    let c = &self.layers[self.active_layer].canvas;
-                    (c.width() as usize, c.height() as usize)
-                };
-                let mask = rasterize_selection_mask(w, h, shape);
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
+        match self.current_selection_mask(w, h) {
+            Some(mask) => {
                 self.layers[self.active_layer].canvas.end_stroke_masked(
                     &self.device, &self.queue, &mut enc, &mask, w,
                 );
@@ -2302,7 +2379,7 @@ impl Renderer {
         // Tier 1: an exact-shape selection rasterizes into a mask on demand (see
         // `paint_gradient_fill`) so Move only cuts the pixels actually inside it, not the
         // whole bounding rect.
-        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let mask = self.current_selection_mask(w, h);
 
         let sel_texel = self.selection_rect.and_then(|[x0, y0, x1, y1]| {
             if x1 <= x0 || y1 <= y0 {
@@ -2382,7 +2459,7 @@ impl Renderer {
             (c.width() as usize, c.height() as usize)
         };
         let src = self.read_active_layer_rgba();
-        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let mask = self.current_selection_mask(w, h);
         let region = self.selection_rect.and_then(|[x0, y0, x1, y1]| {
             if x1 <= x0 || y1 <= y0 {
                 return None;
@@ -2410,7 +2487,7 @@ impl Renderer {
             (c.width() as usize, c.height() as usize)
         };
         let mut pixels = self.read_active_layer_rgba();
-        let sel_mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let sel_mask = self.current_selection_mask(w, h);
         let scale = point_size / font.units_per_em().max(1) as f32;
         let pen_origin = (anchor_uv[0] * w as f32, anchor_uv[1] * h as f32);
         let (sr, sg, sb) = (srgb_to_linear(color[0]), srgb_to_linear(color[1]), srgb_to_linear(color[2]));
@@ -2591,7 +2668,7 @@ impl Renderer {
         let mut pixels = self.read_active_layer_rgba();
         // Tier 1: an exact-shape selection (Ellipse/Lasso) rasterizes into a mask on demand
         // — cheap enough here since it happens once per gradient drag, not once per frame.
-        let mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let mask = self.current_selection_mask(w, h);
         apply_gradient_fill(
             &mut pixels,
             w,
@@ -3556,7 +3633,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, crop_pixels, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
+    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, crop_pixels, feather_mask, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -3892,6 +3969,58 @@ mod m4_tests {
         assert_eq!(mask[0], 255);
         assert_eq!(mask[1 * w + 1], 0, "diagonal neighbor must not leak into the selection");
         assert_eq!(mask[3 * w + 3], 0);
+    }
+
+    #[test]
+    fn feather_radius_zero_is_an_exact_passthrough() {
+        // Hard edge (feather off) must be byte-for-byte identical to the input — this is what
+        // guarantees every tool's no-feather path is unchanged from before feathering existed.
+        let (w, h) = (16, 16);
+        let mut mask = vec![0u8; w * h];
+        for y in 4..12 {
+            for x in 4..12 {
+                mask[y * w + x] = 255;
+            }
+        }
+        assert_eq!(feather_mask(&mask, w, h, 0), mask);
+    }
+
+    #[test]
+    fn feather_softens_a_hard_edge_into_a_monotonic_ramp() {
+        // A hard left/right split (left half 255, right half 0). After feathering, scanning
+        // left-to-right across the boundary should give a smooth, monotonically *decreasing*
+        // ramp instead of a single 255->0 cliff, and the deep interior on each side should be
+        // untouched (still ~255 far left, ~0 far right).
+        let (w, h) = (32, 8);
+        let mut mask = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..(w / 2) {
+                mask[y * w + x] = 255;
+            }
+        }
+        let out = feather_mask(&mask, w, h, 3);
+        let row = (h / 2) * w;
+        // Deep interior unchanged.
+        assert_eq!(out[row + 1], 255, "far-left interior should stay fully selected");
+        assert_eq!(out[row + w - 2], 0, "far-right interior should stay fully unselected");
+        // The boundary is no longer a cliff — some texel straddling x=16 is a partial value.
+        let boundary: Vec<u8> = (13..19).map(|x| out[row + x]).collect();
+        assert!(boundary.iter().any(|&v| v > 10 && v < 245), "expected a soft transition, got {boundary:?}");
+        // Monotonic non-increasing across the whole row (no ringing/overshoot from the blur).
+        for x in 1..w {
+            assert!(out[row + x] <= out[row + x - 1], "ramp must be monotonic at x={x}: {} then {}", out[row + x - 1], out[row + x]);
+        }
+    }
+
+    #[test]
+    fn feather_of_a_fully_selected_mask_stays_fully_selected() {
+        // An all-255 mask has no edge to soften — clamped (not zero-padded) borders mean it
+        // must come back all-255, not darkened at the edges. This is the test that would fail
+        // if the box blur zero-padded instead of edge-clamping.
+        let (w, h) = (12, 9);
+        let mask = vec![255u8; w * h];
+        let out = feather_mask(&mask, w, h, 4);
+        assert!(out.iter().all(|&v| v == 255), "a full mask must stay full after feathering");
     }
 
     #[test]

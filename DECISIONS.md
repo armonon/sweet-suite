@@ -1505,3 +1505,26 @@ Loose gestures (Marquee) looked "close enough" and hid this for weeks; Free Tran
 94 workspace tests green (4 new font tests; the coordinate fix is app-layer UI plumbing with no unit-test surface, verified by the diagnostic-print method above). Clean `cargo build --workspace`, packaged `dist/SweetVisual.app`.
 
 Next: Tier 0 is now clear (M5 canvas, crop, move, free-transform, text all shipped; M5b sparse-canvas remains explicitly deferred). Open: Tier 1 S3 (layer masks), Quick Selection feathering, and the eyes-on re-verification of the Free-Transform corner-drag once the OS Screen Recording capture is working again.
+
+---
+
+## Tier 1: Selection feathering — 2026-07-07
+
+Armon: "lets do that" — took the fully-CPU-testable of the two open Tier 1 items (feathering vs. layer masks), since layer masks still need a compositor change I can't verify live under the ongoing Screen Recording outage, and feathering doesn't touch any shared pipeline.
+
+### What shipped
+A "Feather" slider (0–64 px) in the selection inspector softens the selection's edge, so Paint/Gradient/Move/Text fade out gradually across the boundary instead of a hard cut. `0` = a hard edge, byte-for-byte the prior behavior.
+
+The whole feature is one pure function plus a routing change — no GPU/shader/scissor work:
+- **`feather_mask(mask, w, h, radius)`** (pure fn): runs `box_blur_1ch` twice — a *tent* filter, which gives a smoother, more Gaussian-looking falloff than a single box pass while staying linear-time. `box_blur_1ch` is a separable (H then V), edge-clamped, sliding-window box blur — O(w·h) regardless of radius, so max-radius feather on a large canvas is still a one-shot commit, not a stall. Edge clamping (not zero-padding) is deliberate and tested: a selection touching the canvas border must *not* get a spurious dark fringe there.
+- **`Renderer::current_selection_mask(w, h)`**: the single chokepoint. Rasterizes `selection_extra`, then applies `feather_mask` when `selection_feather > 0`. All five existing mask call sites (paint-end-stroke, gradient, move, free-transform, text) now go through it instead of calling `rasterize_selection_mask` directly — so feathering lands on every tool at once, and there's exactly one place the feather is applied.
+
+### The one honest scope limit, documented in the UI
+Because the blur is symmetric but every bbox-limited tool (Paint's scissor, Gradient/Move/Free-Transform's region) only *visits* the selection's existing bounds, the visible feather is **inset-style**: the falloff softens the interior side of the boundary; the selection's extent/scissor is not widened outward. (Text, which visits glyph pixels anywhere, sees the full symmetric falloff.) This is a real, well-defined behavior — not a bug — and it's stated in the inspector hint ("Applied on the interior side of the boundary — the selection's bounds don't grow") rather than left for a user to discover. A true both-directions feather would mean expanding each tool's processing region + Paint's GPU scissor by the feather radius, which is a larger, cross-tool change; deferred, not pretended-away.
+
+### Testing
+3 new CPU tests (feathering is pure, so it's fully unit-testable — no GPU device, no live check needed): `radius 0` is an exact byte-for-byte passthrough (this is what guarantees every tool's no-feather path is unchanged); a hard left/right split becomes a smooth, *monotonic* (no blur ringing/overshoot) ramp with the deep interior on each side untouched; an all-selected mask stays all-selected after feathering (the test that fails if the box blur zero-pads its borders instead of edge-clamping). 97 workspace tests green (up from 94). Clean `cargo build --workspace`, no warnings.
+
+Verification gap: feathering needs no live check (its correctness is fully captured by the pure-fn tests above), but the *interactive* result — dragging the slider and watching an edge soften on screen — is still unwitnessed under the Screen Recording outage, same as everything else this session. The math is proven; the pixels-on-screen confirmation is owed once capture works.
+
+Next: Tier 1 S3 (layer masks) remains the big open item, still gated on a live-verifiable compositor path; also owed — the eyes-on re-check of Free-Transform's corner-drag and this feather slider once OS Screen Recording is back.

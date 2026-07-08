@@ -83,6 +83,9 @@ pub struct ShellState {
     pub sculpt_strength: f32,
     /// Magic Wand tolerance (0–1 per channel).
     pub magic_wand_tolerance: f32,
+    /// Tier 1: selection feather radius in canvas texels (0 = hard edge). Synced to
+    /// `Renderer::selection_feather`; softens the selection's edge for Paint/Gradient/Move/Text.
+    pub selection_feather: f32,
     /// Set when the user clicks "→ 3D Heightmap" on a paint canvas. main.rs drains this.
     pub pending_heightmap: bool,
     /// Heightmap settings.
@@ -187,6 +190,7 @@ impl Default for ShellState {
             sculpt_radius: 0.5,
             sculpt_strength: 0.05,
             magic_wand_tolerance: 0.1,
+            selection_feather: 0.0,
             pending_heightmap: false,
             heightmap_resolution: 64,
             heightmap_scale: 0.5,
@@ -833,6 +837,17 @@ pub fn draw_shell(
                     "Paint/Gradient/Move all respect the exact shape (Ellipse/Lasso), not just the bounding box."
                 };
                 ui.label(RichText::new(shape_hint).color(TEXT_2).small());
+                ui.add_space(8.0);
+                // Feather (Tier 1): soften the selection edge. 0 = hard edge (unchanged).
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Feather").color(TEXT_2));
+                    ui.add(egui::Slider::new(&mut state.selection_feather, 0.0..=64.0).suffix(" px"));
+                });
+                ui.label(
+                    RichText::new("Softens the selection edge — Paint/Gradient/Move/Text fade out across it instead of a hard cut. Applied on the interior side of the boundary (the selection's bounds don't grow).")
+                        .color(TEXT_2)
+                        .small(),
+                );
                 ui.add_space(12.0);
             }
 
