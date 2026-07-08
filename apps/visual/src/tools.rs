@@ -25,6 +25,7 @@ pub enum Tool {
     Gradient,
     MoveLayer,
     FreeTransform,
+    Text,
     AddCube,
     AddSphere,
     AddImage,
@@ -48,6 +49,7 @@ impl Tool {
             Self::Gradient => "Gradient",
             Self::MoveLayer => "Move Layer",
             Self::FreeTransform => "Free Transform",
+            Self::Text => "Text",
             Self::AddCube => "Add Cube",
             Self::AddSphere => "Add Sphere",
             Self::AddImage => "Add Image Plane",
@@ -70,6 +72,7 @@ impl Tool {
             Self::Gradient => "Drag on the canvas to fill the active layer with a gradient from the brush colour to transparent (or pick endpoints in the inspector). Linear or radial. Respects the active selection. G to activate.",
             Self::MoveLayer => "Drag on the canvas to move the active layer's pixels. With an active selection, only the selected pixels move (leaving a transparent hole). V to activate.",
             Self::FreeTransform => "Drag a corner handle to scale (anchored at the opposite corner) or the handle above the box to rotate. Selection-aware like Move. Each drag commits as its own undo step on release. T to activate.",
+            Self::Text => "Click the canvas to set where text starts, then type in the inspector and press Apply. Load a .ttf font first. Single-line only — no wrapping/kerning yet.",
             Self::AddCube => "Adds a unit cube where you click and selects it.",
             Self::AddSphere => "Adds a unit sphere where you click and selects it.",
             Self::AddImage => "Adds a textured image plane where you click and selects it.",
@@ -171,6 +174,9 @@ pub struct InputState {
     pub transform_scale: f32,
     /// Live rotation delta (radians) accumulated during a `Rotate` drag (0.0 = identity).
     pub transform_rotation: f32,
+    /// Text tool (M4a): UV point set by the last click — where the typed string's baseline
+    /// starts. `None` until the user clicks once with the tool active.
+    pub text_anchor: Option<[f32; 2]>,
 }
 
 /// Free Transform (M4c): which part of the transform box the current drag is driving. The
@@ -811,7 +817,11 @@ pub fn handle_left_press(
             let corners_uv = [[bx0, by0], [bx1, by0], [bx0, by1], [bx1, by1]];
             let opposite_uv = [[bx1, by1], [bx0, by1], [bx1, by0], [bx0, by0]];
             let (px, py) = input.cursor;
-            let near = |hx: f32, hy: f32| ((px - hx).powi(2) + (py - hy).powi(2)).sqrt() < 10.0;
+            // `input.cursor` is physical pixels; the tolerance is defined in logical points
+            // (16 — generous for an 8-logical-point-square handle) and scaled up so the grab
+            // zone feels the same size regardless of the display's HiDPI factor.
+            let tolerance = 16.0 * shell.ui_scale;
+            let near = |hx: f32, hy: f32| ((px - hx).powi(2) + (py - hy).powi(2)).sqrt() < tolerance;
 
             input.transform_mode = if near(rotate_handle.0, rotate_handle.1) {
                 let start_angle = (py - ccy).atan2(px - ccx);
@@ -825,6 +835,16 @@ pub fn handle_left_press(
             input.transform_scale = 1.0;
             input.transform_rotation = 0.0;
             input.transform_drag_start = Some(input.cursor);
+        }
+        Tool::Text => {
+            // Just record where the baseline starts — typing and committing happen in the
+            // inspector, not on the canvas (no floating on-canvas text box in v1).
+            let (l, t, r, b) = canvas;
+            let cw = (r - l).max(1.0);
+            let ch = (b - t).max(1.0);
+            let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+            let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+            input.text_anchor = Some([u, v]);
         }
         Tool::Paint => {
             // Stamp a single dab where the press landed; the drag continues the stroke.

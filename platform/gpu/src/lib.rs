@@ -22,6 +22,7 @@ use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 mod compositor;
+pub mod font;
 mod raster;
 mod shaders;
 mod tile_canvas;
@@ -350,6 +351,35 @@ fn srgb_to_linear(c: f32) -> f32 {
 #[inline]
 fn linear_to_srgb(c: f32) -> f32 {
     if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// **Pure**: source-over composite one already-linear `(sr, sg, sb, sa)` sample onto the
+/// sRGB-encoded destination pixel at byte offset `di`, in place. The same per-pixel blend
+/// used inline by `move_selection_pixels`/`apply_free_transform`, pulled out as its own
+/// function for `Renderer::apply_text` (M4a) rather than duplicated a fourth time.
+#[inline]
+fn composite_over(dst: &mut [u8], di: usize, sr: f32, sg: f32, sb: f32, sa: f32) {
+    if sa <= 0.0 {
+        return;
+    }
+    let da = dst[di + 3] as f32 / 255.0;
+    let dr = srgb_to_linear(dst[di] as f32 / 255.0);
+    let dg = srgb_to_linear(dst[di + 1] as f32 / 255.0);
+    let db = srgb_to_linear(dst[di + 2] as f32 / 255.0);
+    let oa = sa + da * (1.0 - sa);
+    let (or_, og, ob) = if oa > 1e-6 {
+        (
+            (sr * sa + dr * da * (1.0 - sa)) / oa,
+            (sg * sa + dg * da * (1.0 - sa)) / oa,
+            (sb * sa + db * da * (1.0 - sa)) / oa,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    dst[di] = (linear_to_srgb(or_).clamp(0.0, 1.0) * 255.0).round() as u8;
+    dst[di + 1] = (linear_to_srgb(og).clamp(0.0, 1.0) * 255.0).round() as u8;
+    dst[di + 2] = (linear_to_srgb(ob).clamp(0.0, 1.0) * 255.0).round() as u8;
+    dst[di + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
 }
 
 /// **Pure** gradient fill over an RGBA8 (sRGB-encoded) buffer. Interpolates `color_a`→
@@ -2366,6 +2396,58 @@ impl Renderer {
         let pivot = (pivot_uv[0] * w as f32, pivot_uv[1] * h as f32);
         let dst = apply_free_transform(&src, w, h, region, pivot, scale, rotation, mask.as_deref());
         self.write_active_layer_undoable(&dst);
+    }
+
+    /// **M4a: Text.** Lay out `text` as a single line (see `font::layout_line`) starting at
+    /// `anchor_uv`, rasterize each glyph (see `font::rasterize_glyph`), and composite them
+    /// onto the active layer in `color` (linear RGBA) — one undoable write for the whole
+    /// string, same "readback, mutate in CPU memory, write back once" shape as every other
+    /// M4 tool. Respects the active selection (mask-aware, same convention as Paint/Gradient/
+    /// Move/Free Transform).
+    pub fn apply_text(&mut self, font: &font::Font, text: &str, anchor_uv: [f32; 2], point_size: f32, color: [f32; 4]) {
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
+        let mut pixels = self.read_active_layer_rgba();
+        let sel_mask = self.selection_extra.as_ref().map(|shape| rasterize_selection_mask(w, h, shape));
+        let scale = point_size / font.units_per_em().max(1) as f32;
+        let pen_origin = (anchor_uv[0] * w as f32, anchor_uv[1] * h as f32);
+        let (sr, sg, sb) = (srgb_to_linear(color[0]), srgb_to_linear(color[1]), srgb_to_linear(color[2]));
+
+        for (glyph_id, pen_x_units) in font::layout_line(font, text) {
+            let outline = font.glyph_outline(glyph_id);
+            let (glyph_mask, gw, gh, ox, oy) = font::rasterize_glyph(&outline, scale);
+            if gw == 0 || gh == 0 {
+                continue;
+            }
+            let base_x = pen_origin.0 + pen_x_units * scale + ox;
+            let base_y = pen_origin.1 + oy;
+            for gy in 0..gh {
+                let py = (base_y + gy as f32).round() as i64;
+                if py < 0 || py >= h as i64 {
+                    continue;
+                }
+                for gx in 0..gw {
+                    let px = (base_x + gx as f32).round() as i64;
+                    if px < 0 || px >= w as i64 {
+                        continue;
+                    }
+                    let cov = glyph_mask[gy * gw + gx] as f32 / 255.0;
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let (px, py) = (px as usize, py as usize);
+                    let sel = match &sel_mask {
+                        Some(m) => m[py * w + px] as f32 / 255.0,
+                        None => 1.0,
+                    };
+                    let sa = color[3].clamp(0.0, 1.0) * cov * sel;
+                    composite_over(&mut pixels, (py * w + px) * 4, sr, sg, sb, sa);
+                }
+            }
+        }
+        self.write_active_layer_undoable(&pixels);
     }
 
     /// **M4: Crop.** Crop the whole document to the UV-space rect `[x0, y0, x1, y1]` (every

@@ -25,7 +25,7 @@ These are table-stakes; their absence is the first thing a Photoshop user notice
 |---|---|---|---|---|
 | M5 | ~~**Arbitrary canvas size**~~ **DONE (core) 2026-07-06** | Fixed square surface is the single most glaring limit — real images aren't square. | M | Shipped: `RasterCanvas` width/height decoupled everywhere; "Import Image" sizes the whole canvas to the image's native aspect (no more white-padding); 90° rotate became a whole-document op; PaintCanvas 3D quad rescales to match. **Still open:** wiring the sparse `TileCanvas` (256² tiles, up to 4096² extent) as the main surface for truly huge/gigapixel canvases — a distinct, larger feature, tracked as M5b below. See DECISIONS.md 2026-07-06. |
 | M5b | **Sparse/huge canvas via `TileCanvas`** | Split out of M5 — genuinely separate scope (sparse allocation, cross-tile brush stamping, compositor changes) from "not forced square". | L | `platform/gpu/src/tile_canvas.rs` already exists and is tested in isolation; wire it in as the main per-layer surface once there's a concrete need for canvases beyond ~4K². |
-| M4a | **Text / type tool** | Every editor has text; its absence reads as "toy". | L | Font-file **byte parsing** (pure format decode) is fine to depend on; hand-build the layout/kerning/rasterization on top ourselves. Start: single-line Latin, font/size/color, rasterize to active layer — defer full Unicode shaping/bidi/complex scripts. |
+| M4a | ~~**Text / type tool**~~ **DONE (v1) 2026-07-07** | Every editor has text; its absence reads as "toy". | L | Shipped: `Tool::Text` ("Txt") + a fully clean-room TrueType stack in `platform/gpu/src/font.rs` (no `ttf-parser`/`fontdue` — hand-written sfnt/`cmap`-fmt4/`glyf` parser + supersampled even-odd glyph rasterizer + `layout_line`). Load a `.ttf`, type a string+size, Apply → composites to the active layer in the brush colour, undoable, selection/mask-aware. **Verified live** (real Arial.ttf → "SWEET" rendered correctly on canvas). v1 scope: `glyf` outlines only (no OTF/CFF), simple glyphs only (accented composites blank), cmap fmt 4 (full BMP), no kerning/hinting/bidi. Font files never committed (proprietary); tests read system Arial + skip if absent. See DECISIONS.md 2026-07-07. |
 | M4b | ~~**Crop**~~ **DONE 2026-07-06** | Trivially expected; unblocked by M5's canvas-resize machinery. | S | Shipped: `Renderer::crop_to_rect` reuses M3's rect selection as the crop source + M5's drain-and-recreate pattern. "Crop to Selection" in the RectSelect inspector. See DECISIONS.md. |
 | M4c | ~~**Free transform**~~ **DONE (scale + rotate) 2026-07-07** | Only flip/rotate-90 existed before this. | M | Shipped: `Tool::FreeTransform` ("Xfrm", **T**) — 4 corner handles (uniform scale, anchored at the opposite corner) + 1 rotate handle (about the box center), selection-aware like Move. `apply_free_transform` (pure fn, nearest-neighbor sampling — bilinear deferred, see DECISIONS.md). Each drag commits as its own undo step (no multi-parameter staging session like Photoshop's real Free Transform — a deliberate v1 scope cut). **Not done:** skew, and drag-inside-box-to-translate (use Move for that). |
 | M4d | ~~**Move (2D)**~~ **DONE 2026-07-06** | Photoshop's most-used tool had no SWEET equivalent. | S–M | Shipped: `Tool::MoveLayer` ("MovL", **V**), commit-on-release like Gradient. Selection-aware: with a selection active, only that region moves (leaving a transparent hole); with none, the whole layer shifts. See DECISIONS.md. |
@@ -72,7 +72,7 @@ multires/dyntopo sculpting. Revisit only if a concrete user need pulls them in.
 ## Sequencing summary
 
 ```
-Tier 0  (floor)      → M5 canvas (done) · crop (done) · free-transform (done) · text · M5b sparse canvas
+Tier 0  (floor)      → M5 canvas (done) · crop (done) · free-transform (done) · text (done) · M5b sparse canvas (deferred) — Tier 0 core complete
 Tier 1  (selections) → mask texture (done) → lasso/poly (done) → wand→selection (done) → feather/layer masks
 Tier 2  (3D interop) → glTF/OBJ I/O → PBR material → UV unwrap
 Tier 3  (unified)    → depth/color passes → render-to-layer → local AI bridge
@@ -117,7 +117,7 @@ partial/different semantics · ⬜ gap, with the effort tier it'd land in.
 | Blur / Sharpen / Smudge (drag brush) | 🟡 Smudge ✅ (brush param); Blur/Sharpen exist only as full-image adjustment filters, not a localized drag brush | Medium |
 | Dodge / Burn / Sponge | ⬜ — brush-based tonal ops | Medium |
 | Pen / Freeform / Curvature / anchor points | ⬜ — no vector-path architecture at all | Large, own future tier |
-| Type | ⬜ | M4a (tracked, effort L) |
+| Type | ✅ `Tool::Text` (M4a, 2026-07-07) — single-line, clean-room TrueType; no paragraph/box text or OTF/composite glyphs yet | — |
 | Path/Shape Selection | N/A without vector paths | — |
 | Shape tools (rect/ellipse/polygon/line/custom) | ⬜ as vector layers — SWEET's Add-Cube/Sphere/etc are 3D primitives, not 2D vector shapes | Large |
 | Hand / Zoom / Rotate View | 🟡 — arrow-key orbit + ±zoom (3D camera) covers the 3D case; no dedicated 2D pan/zoom-drag tool | Small |

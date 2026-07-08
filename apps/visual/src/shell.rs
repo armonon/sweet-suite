@@ -24,6 +24,7 @@ pub enum FileAction {
     SaveAs,
     ImportImage,
     ExportPng,
+    LoadFont,
 }
 
 /// A command from the Layers panel; main.rs applies it to the renderer's layer stack.
@@ -45,6 +46,21 @@ pub struct ShellState {
     pub right_panel_w: f32,
     pub bottom_strip_h: f32,
     pub top_bar_h: f32,
+    /// The canvas viewport in *physical* pixels, captured directly from
+    /// `ui.available_rect_before_wrap()` (× `pixels_per_point`) at the one point in the frame
+    /// that value is authoritative — right before the canvas overlay is drawn, i.e. after
+    /// every panel (top/left/right/*both* bottom panels) has already claimed its space. This
+    /// is what `canvas_rect()` returns; see its doc comment for why summing individual panel
+    /// dimensions (the older approach, kept below only for the ones still measured for other
+    /// UI purposes) is fragile — it silently drifts out of sync if a panel is added without
+    /// remembering to fold its height in.
+    pub canvas_rect_physical: (f32, f32, f32, f32),
+    /// egui's `pixels_per_point` (the display's HiDPI scale factor, e.g. 2.0 on a Retina
+    /// Mac) — `left_strip_w`/`right_panel_w`/etc. above are egui layout rects, always in
+    /// *logical points*, but `canvas_rect()` converts them against `renderer.size()`, which
+    /// is the wgpu surface's *physical* pixel size. This field is what makes that conversion
+    /// correct; see `canvas_rect()`.
+    pub ui_scale: f32,
     pub current_path: Option<PathBuf>,
     pub dirty: bool,
     pub pending_file_action: Option<FileAction>,
@@ -117,6 +133,23 @@ pub struct ShellState {
     /// `None` (not read in that case).
     pub transform_scale: f32,
     pub transform_rotation: f32,
+    /// Text tool (M4a): baseline anchor, synced from `InputState` before each frame (same
+    /// one-way sync as the Free Transform fields above — the overlay/inspector only read it).
+    pub text_anchor: Option<[f32; 2]>,
+    /// The string being composed in the inspector's text field.
+    pub text_input: String,
+    /// Point size in canvas pixels (not font units — this is what the user actually sees).
+    pub text_size: f32,
+    /// The currently loaded font, if any. `Rc` (not owned per-clone) since a `Font` holds the
+    /// whole file's bytes (hundreds of KB to a few MB) and cloning it on every sync would be
+    /// wasteful; shared read-only access is all any of Load/Apply/inspector-display need.
+    pub loaded_font: Option<std::rc::Rc<suite_gpu::font::Font>>,
+    /// Filename of the loaded font (display only), or a parse-error message — whichever the
+    /// last "Load Font" attempt produced.
+    pub text_font_status: Option<String>,
+    /// Set by the inspector's "Apply Text" button; drained in main.rs (needs `&mut Renderer`,
+    /// which `draw_shell` doesn't have) — same pattern as `pending_crop`/`pending_layer_transform`.
+    pub pending_apply_text: bool,
     /// Set by the inspector flip/180° buttons; drained in main.rs to call the renderer.
     /// Always dimension-preserving — safe regardless of canvas aspect ratio (M5).
     pub pending_layer_transform: Option<suite_gpu::LayerTransform>,
@@ -138,6 +171,8 @@ impl Default for ShellState {
             right_panel_w: 0.0,
             bottom_strip_h: 0.0,
             top_bar_h: 0.0,
+            canvas_rect_physical: (0.0, 0.0, 1.0, 1.0),
+            ui_scale: 1.0,
             current_path: None,
             dirty: false,
             pending_file_action: None,
@@ -173,6 +208,12 @@ impl Default for ShellState {
             transform_mode: None,
             transform_scale: 1.0,
             transform_rotation: 0.0,
+            text_anchor: None,
+            text_input: String::new(),
+            text_size: 48.0,
+            loaded_font: None,
+            text_font_status: None,
+            pending_apply_text: false,
             pending_layer_transform: None,
             pending_canvas_rotate: None,
             pending_crop: None,
@@ -183,8 +224,26 @@ impl Default for ShellState {
 impl ShellState {
     /// The canvas rectangle in *physical* pixels (the area between the panels).
     /// The tool layer uses this to project cursor coords into the world ray.
+    ///
+    /// Returns `canvas_rect_physical`, captured once per frame directly from
+    /// `ui.available_rect_before_wrap()` — the authoritative "what's left after every panel
+    /// claimed its space" value egui itself computes — converted to physical pixels via
+    /// `ui_scale`. `winit::CursorMoved` (what `input.cursor` holds) is physical too, so this
+    /// keeps hit-testing in the same coordinate space as the actual click.
+    ///
+    /// Deliberately does *not* reconstruct the rect by summing `left_strip_w`/`right_panel_w`/
+    /// `top_bar_h`/`bottom_strip_h` (an earlier version of this function did): that approach
+    /// silently drifted out of sync when a second bottom panel (`timeline_bar`) was added
+    /// later without remembering to fold its height into `bottom_strip_h` — precise targets
+    /// like Free Transform's corner handles missed by tens of pixels while looser gestures
+    /// (Marquee) still looked "close enough" at a glance. `framebuffer` is unused now except
+    /// as the pre-first-frame fallback (before `canvas_rect_physical` has ever been set).
     pub fn canvas_rect(&self, framebuffer: (u32, u32)) -> (f32, f32, f32, f32) {
-        let scale = 1.0; // egui's pixels_per_point factors into the coords coming in
+        if self.canvas_rect_physical.2 > self.canvas_rect_physical.0 + 1.0 {
+            return self.canvas_rect_physical;
+        }
+        // Fallback for the very first frame(s), before `draw_shell` has run once.
+        let scale = self.ui_scale.max(1.0);
         let l = self.left_strip_w * scale;
         let t = self.top_bar_h * scale;
         let r = (framebuffer.0 as f32) - self.right_panel_w * scale;
@@ -301,6 +360,9 @@ pub fn draw_shell(
     // Reset the per-frame "an inspector edit happened" flag; set below when any inspector
     // control mutates the document. main.rs reads it to drive command-delta undo.
     state.edited_object = false;
+    // `canvas_rect()` needs this to correctly convert its logical-point panel measurements
+    // against `renderer.size()`'s physical pixels — see the field doc comment.
+    state.ui_scale = ui.ctx().pixels_per_point();
     // --- Top bar -------------------------------------------------------------
     let top = Panel::top("top_bar")
         .resizable(false)
@@ -421,6 +483,7 @@ pub fn draw_shell(
                     (Tool::Gradient, "Grd", "G"),
                     (Tool::MoveLayer, "MovL", "V"),
                     (Tool::FreeTransform, "Xfrm", "T"),
+                    (Tool::Text, "Txt", "·"),
                     (Tool::AddCube, "Cub", "3"),
                     (Tool::AddSphere, "Sph", "4"),
                     (Tool::AddImage, "Img", "5"),
@@ -458,7 +521,7 @@ pub fn draw_shell(
                             Tool::Select | Tool::Translate | Tool::Paint
                             | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
                             | Tool::Gradient | Tool::MoveLayer | Tool::FreeTransform
-                            | Tool::Eyedropper => {
+                            | Tool::Text | Tool::Eyedropper => {
                                 state.tool = tool
                             }
                             Tool::AddCube => {
@@ -814,6 +877,47 @@ pub fn draw_shell(
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Nearest-neighbor sampling (not smoothed/bilinear yet) — scaled and rotated edges will look a little aliased.")
+                        .color(TEXT_2)
+                        .small(),
+                );
+                ui.add_space(12.0);
+            }
+
+            if state.tool == Tool::Text {
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Text").color(TEXT_0).strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(RichText::new("Load Font…").color(TEXT_0)).clicked() {
+                        state.pending_file_action = Some(FileAction::LoadFont);
+                    }
+                    if let Some(status) = &state.text_font_status {
+                        ui.label(RichText::new(status).color(TEXT_2).small());
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(RichText::new("String").color(TEXT_2));
+                ui.text_edit_singleline(&mut state.text_input);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Size").color(TEXT_2));
+                    ui.add(egui::DragValue::new(&mut state.text_size).speed(0.5).range(4.0..=400.0));
+                });
+                ui.add_space(4.0);
+                let anchor_label = match state.text_anchor {
+                    Some([u, v]) => format!("Baseline at ({:.0}%, {:.0}%) — click elsewhere to move it.", u * 100.0, v * 100.0),
+                    None => "Click on the canvas to place the baseline.".to_string(),
+                };
+                ui.label(RichText::new(anchor_label).color(TEXT_2).small());
+                ui.add_space(4.0);
+                let can_apply = state.loaded_font.is_some() && !state.text_input.is_empty() && state.text_anchor.is_some();
+                if ui.add_enabled(can_apply, egui::Button::new(RichText::new("Apply Text").color(TEXT_0))).clicked() {
+                    state.pending_apply_text = true;
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Uses the brush colour. Single line only (no wrapping/kerning/bidi). TrueType (.ttf) glyf outlines only — not OTF/CFF or composite glyphs (accented characters may render blank). ⌘Z undoes.")
                         .color(TEXT_2)
                         .small(),
                 );
@@ -1476,6 +1580,17 @@ pub fn draw_shell(
     // the side/top/bottom panels were laid out — i.e. the canvas viewport, matching the
     // `canvas_rect`/UV convention the tool handlers use.
     let canvas_rect = ui.available_rect_before_wrap();
+    // Publish the authoritative physical-pixel canvas rect for `canvas_rect()` (see its doc
+    // comment) — captured right here since this is the one place in the frame
+    // `available_rect_before_wrap()` reflects every panel, not just the ones a hand-summed
+    // reconstruction remembered to include.
+    let ppp = ui.ctx().pixels_per_point();
+    state.canvas_rect_physical = (
+        canvas_rect.left() * ppp,
+        canvas_rect.top() * ppp,
+        canvas_rect.right() * ppp,
+        canvas_rect.bottom() * ppp,
+    );
     let painter = ui.ctx().layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("canvas_overlay"),
@@ -1627,6 +1742,21 @@ pub fn draw_shell(
                 })
                 .collect();
             painter.add(egui::Shape::closed_line(preview_pts, egui::Stroke::new(2.0, ACCENT_HOVER)));
+        }
+    }
+
+    // Text tool (M4a): a crosshair at the baseline anchor — no live glyph preview (that would
+    // mean rasterizing on every frame while the inspector's text field is being typed into;
+    // "click, type, Apply" keeps this cheap and simple, same commit-on-demand spirit as the
+    // other M4 tools' commit-on-release).
+    if state.tool == Tool::Text {
+        if let Some([u, v]) = state.text_anchor {
+            let rect = canvas_rect;
+            let p = egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height());
+            let r = 7.0;
+            painter.line_segment([egui::pos2(p.x - r, p.y), egui::pos2(p.x + r, p.y)], egui::Stroke::new(1.5, egui::Color32::BLACK));
+            painter.line_segment([egui::pos2(p.x, p.y - r), egui::pos2(p.x, p.y + r)], egui::Stroke::new(1.5, egui::Color32::BLACK));
+            painter.circle_stroke(p, r, egui::Stroke::new(1.5, egui::Color32::WHITE));
         }
     }
 }

@@ -290,6 +290,29 @@ impl App {
                     }
                 }
             }
+            FileAction::LoadFont => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("TrueType font", &["ttf"])
+                    .pick_file()
+                {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    match std::fs::read(&path) {
+                        Ok(bytes) => match suite_gpu::font::Font::parse(bytes) {
+                            Ok(font) => {
+                                self.shell.loaded_font = Some(std::rc::Rc::new(font));
+                                self.shell.text_font_status = Some(format!("Loaded {name}"));
+                            }
+                            Err(e) => {
+                                self.shell.loaded_font = None;
+                                self.shell.text_font_status = Some(format!("{name}: {e}"));
+                            }
+                        },
+                        Err(e) => {
+                            self.shell.text_font_status = Some(format!("Couldn't read {name}: {e}"));
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -977,6 +1000,8 @@ impl ApplicationHandler for App {
                 self.shell.transform_mode = self.input.transform_mode;
                 self.shell.transform_scale = self.input.transform_scale;
                 self.shell.transform_rotation = self.input.transform_rotation;
+                // Text tool (M4a): same read-only sync.
+                self.shell.text_anchor = self.input.text_anchor;
 
                 let raw_input = egui_state.take_egui_input(window.as_ref());
                 let full_output = self.egui_context.run_ui(raw_input, |ui| {
@@ -1015,6 +1040,22 @@ impl ApplicationHandler for App {
                     }
                     self.shell.dirty = true;
                     window.request_redraw();
+                }
+
+                // Apply the Text tool's composed string (M4a), issued by the "Apply Text"
+                // button — needs `&mut Renderer`, which `draw_shell` doesn't have, so it's
+                // drained here like Crop/rotate/layer-transform above.
+                if self.shell.pending_apply_text {
+                    self.shell.pending_apply_text = false;
+                    if let (Some(font), Some(anchor)) = (self.shell.loaded_font.clone(), self.shell.text_anchor) {
+                        if !self.shell.text_input.is_empty() {
+                            renderer.apply_text(&font, &self.shell.text_input, anchor, self.shell.text_size, self.shell.brush.color);
+                            self.undo_order.push(UndoKind::Paint);
+                            self.redo_order.clear();
+                            self.shell.dirty = true;
+                            window.request_redraw();
+                        }
+                    }
                 }
 
                 // Apply a layer transform (M4 flip/180°) issued by an inspector button.

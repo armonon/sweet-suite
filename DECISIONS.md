@@ -1467,3 +1467,41 @@ The first rotation test failed: I'd predicted a marker "2 texels above the pivot
 Verification gap continues (Screen Recording still blocked at the OS capture layer this session) — same substitution as every prior entry: the automated suite, plus the nearest-neighbor scope cut above taken specifically because of it.
 
 Next: M4a (text tool, effort L — clean-room font parsing + layout) is the last open Tier 0 item; Tier 1 S3 (layer masks) and Quick Selection feathering remain open pending either a compositor-shader change I can verify live, or a non-performance-regressing CPU path.
+
+---
+
+## M4a: Text tool (clean-room TrueType) + a HiDPI hit-test coordinate bug — 2026-07-07
+
+Two things landed together: the Text tool (the last open Tier 0 item), and a canvas-coordinate bug I found *while trying to verify Free Transform's corner-drag* — the kind of latent bug that only a precise-target tool surfaces.
+
+### M4a — Text tool
+
+**What shipped.** `Tool::Text` ("Txt"): click the canvas to place a baseline, type a string + pick a size in the inspector, "Load Font…" a `.ttf`, and "Apply Text" composites it onto the active layer in the brush colour, as one undoable step. Selection/mask-aware the same way Paint/Gradient/Move/Free-Transform are.
+
+The whole font stack is hand-written in `platform/gpu/src/font.rs` — no `ttf-parser`/`fontdue`/`rustybuzz`, per [[feedback-sweet-clean-room-over-vendoring]] (a font engine is product-differentiating logic, not plumbing):
+- **Parser**: sfnt table directory → `head` (units-per-em, loca format), `maxp` (glyph count), `loca`/`glyf` (outlines), `hhea`/`hmtx` (advance widths), and a Unicode `cmap` format-4 subtable (the fiddly `idRangeOffset` indirection — a byte offset measured *from the field's own address* into a parallel glyph-id array — is the one genuinely error-prone part of format 4, and it's commented as such).
+- **Rasterizer**: flattens each glyph contour (resolving TrueType's on/off-curve quadratic-Bezier convention, including the *implied* on-curve midpoint between two consecutive control points) into a polyline, then 4× supersampled even-odd scanline fill — the same fill algorithm already proven in `rasterize_selection_mask`'s polygon arm, reused rather than written fresh. Font space is y-up; the rasterizer flips to the app's y-down pixel convention.
+- **Layout**: `layout_line` — left-to-right cmap-lookup + hmtx-advance accumulation. Single line, no kerning/GPOS/bidi/shaping.
+
+**Verified live — the one feature this session I got real eyes on.** Screen Recording briefly came back mid-session, so I drove the actual packaged app: loaded the real system `Arial.ttf`, typed "SWEET", hit Apply, and confirmed correct, legible glyphs rendered on the canvas (screenshot-confirmed). That's the strongest verification any feature got this session — a genuine end-to-end path from a real font file's bytes through my parser and rasterizer to correct pixels on screen.
+
+**Deliberate v1 scope, documented not hidden:** TrueType `glyf` outlines only (no OTF/CFF PostScript outlines); *simple* glyphs only (composite/compound glyphs render blank — this is why accented Latin like "é" won't show yet, stated in the inspector hint); `cmap` format 4 only (covers the whole BMP, i.e. all of ASCII/Latin-1); no hinting (parsed past, never executed — affects only small-size crispness); no kerning.
+
+**Font files are never committed.** Arial (and every mainstream system font) is proprietary and not redistributable — only my *parsing code* is original and owned. The tests read the system font at test time from `/System/Library/Fonts/Supplemental/Arial.ttf` and skip gracefully (not fail) on any machine without it, so CI on a Linux box won't break. 4 font tests: parses Arial + maps ASCII to real glyph ids (and PUA → .notdef); space has metrics but no visible outline; a rasterized "H" shows ink in both vertical strokes and a gap between them at a sampled row above the crossbar; `layout_line` accumulates advances left-to-right with equal spacing for repeated glyphs.
+
+### The coordinate bug — found chasing Free Transform, fixes every canvas tool
+
+While trying to verify M4c's Free Transform corner-drag, the corner handles wouldn't grab — the box wouldn't scale. Root cause was **not** in Free Transform: `ShellState::canvas_rect()` (which every canvas tool uses to map a physical-pixel cursor into the canvas's UV space) was reconstructing the canvas rectangle by *summing hand-tracked panel dimensions* — `left_strip_w`, `right_panel_w`, `top_bar_h`, `bottom_strip_h` — and it had drifted:
+1. **HiDPI**: an earlier version applied `scale = 1.0` where it needed the real `pixels_per_point` (2.0 on this Retina display), so on any HiDPI screen the whole mapping was off by 2×.
+2. **A missed panel**: `bottom_strip_h` only measured *one* of the two stacked bottom panels — the timeline bar was added later and its height never got folded in — so the bottom edge was wrong by the timeline bar's height.
+
+Loose gestures (Marquee) looked "close enough" and hid this for weeks; Free Transform's pixel-precise corner handles were the first thing that actually *needed* the rect to be exact, and exposed it.
+
+**Fix — stop reconstructing, publish the authoritative value.** egui already computes exactly this rectangle every frame as `ui.available_rect_before_wrap()` ("what's left after every panel claimed its space"). Now `draw_shell` captures that directly (× `pixels_per_point`) into `canvas_rect_physical`, and `canvas_rect()` returns it verbatim. No more hand-summed reconstruction that silently rots when a panel is added — the one place egui knows the true answer is now the one place we read it. (The old sum survives only as a pre-first-frame fallback.) Also widened Free Transform's handle grab zone from a hardcoded 10 physical px to `16 * ui_scale` logical points, so the grab feels the same size at any DPI.
+
+**Verification gap, honestly:** by the time I had this fix built, the Screen Recording outage had returned, so I could *not* re-drive the corner-drag interactively to watch it work end-to-end. What I *did* confirm: direct diagnostic prints showed `canvas_rect()` and the overlay's `available_rect_before_wrap()` now agree exactly (they diverged by the DPI factor + timeline-bar height before), which is the actual coordinate-math bug. So the fix is confirmed correct *at the math level*, not yet re-confirmed at the "watched the box scale" level. Same honesty posture as every prior entry: the substituted evidence is named, and what's still owed (an eyes-on pass once Screen Recording is stable) is stated rather than glossed. Note the diagnostic `eprintln!`s were removed before commit.
+
+### Testing
+94 workspace tests green (4 new font tests; the coordinate fix is app-layer UI plumbing with no unit-test surface, verified by the diagnostic-print method above). Clean `cargo build --workspace`, packaged `dist/SweetVisual.app`.
+
+Next: Tier 0 is now clear (M5 canvas, crop, move, free-transform, text all shipped; M5b sparse-canvas remains explicitly deferred). Open: Tier 1 S3 (layer masks), Quick Selection feathering, and the eyes-on re-verification of the Free-Transform corner-drag once the OS Screen Recording capture is working again.
