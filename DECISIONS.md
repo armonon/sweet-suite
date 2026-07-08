@@ -1528,3 +1528,30 @@ Because the blur is symmetric but every bbox-limited tool (Paint's scissor, Grad
 Verification gap: feathering needs no live check (its correctness is fully captured by the pure-fn tests above), but the *interactive* result — dragging the slider and watching an edge soften on screen — is still unwitnessed under the Screen Recording outage, same as everything else this session. The math is proven; the pixels-on-screen confirmation is owed once capture works.
 
 Next: Tier 1 S3 (layer masks) remains the big open item, still gated on a live-verifiable compositor path; also owed — the eyes-on re-check of Free-Transform's corner-drag and this feather slider once OS Screen Recording is back.
+
+---
+
+## Tier 1 S3: Layer masks — 2026-07-07
+
+Armon: "yes" — took on the one Tier 1 item I'd been holding back specifically because it needs a compositor change I can't watch on screen. The thing that unblocked it: the layer composite is a GPU shader, and a shader *can* be verified headlessly (run it on a test device, read the pixels back) — that's real verification even with Screen Recording down, unlike the interactive tools.
+
+### What shipped
+Non-destructive per-layer masks. A layer can carry an optional grayscale mask (white = reveal, black = hide, gray = partial) that modulates its alpha during compositing without touching the layer's actual pixels. v1 authoring is **"Mask from Selection"**: make any selection (rect/ellipse/lasso/wand, feather included), click it on the layer, and everything outside the selection is hidden — which cleanly closes the loop on all of Tier 1's selection work (every selection tool + feather feeds straight into masks). Plus "Clear" to drop the mask.
+
+Design choices:
+- **The mask is just another `RasterCanvas`.** `PaintLayer.mask: Option<RasterCanvas>` — reusing the paint substrate means the mask gets the entire brush/undo/texture machinery for free, and is exactly the right shape for the eventual "paint directly on the mask" follow-up.
+- **The compositor change is one line, with a provably-identical no-mask path.** `LAYER_COMPOSITE_WGSL` gained `@binding(4)` (a mask texture) and `sa = src.a * opacity * m`. Layers with no mask bind a **1×1 opaque-white** texture → `m = 1.0` → the math is byte-for-byte the pre-S3 path. So adding masks cannot change how any existing (unmasked) document composites — the risk of touching the shared composite shader is contained to `* 1.0`.
+- **From-selection reuses the feathering chokepoint.** `set_active_layer_mask_from_selection` builds the mask via `selection_coverage_mask`, which returns the *feathered* exact-shape mask (`current_selection_mask`) when there's an Ellipse/Lasso/Wand shape, or a plain rect fill otherwise — so a feathered selection makes a soft-edged mask with no extra code.
+
+### Verification — a real GPU test, not just the math
+This is the part I flagged to Armon as the reason S3 was blocked, so it's the part I most wanted to actually verify. Wrote a headless-GPU test (`layer_mask_gpu_tests`) that builds a pipeline from the **exact** `LAYER_COMPOSITE_WGSL` string the app composites with, runs it on a real test device, and reads the output back: a red top layer over a green base, through a half-black/half-white mask, correctly shows **green where the mask is black** (layer hidden, base shows through) and **red where it's white** (layer composited normally). A second test asserts an all-white mask is pixel-identical to red-over-green — i.e. proves the no-mask fallback is a true no-op on hardware, not just in my head. This is genuinely stronger than the "math is tested, shader mirrors it" posture I've had to settle for on the interactive tools this session — the actual shader ran and produced the right pixels.
+
+### Explicitly deferred (documented in the Layers panel, not silently missing)
+- **Painting directly on the mask** — the classic layer-mask interaction. The plumbing is ready (the mask is a `RasterCanvas`), but routing the brush/undo path to target the mask instead of the layer color is its own increment. From-selection is a complete, genuinely-useful authoring path on its own (it's one of the most common real mask workflows), so v1 ships without paint-on-mask and tracks it.
+- **Persistence** — masks are session-only in v1; the `.sweet` `LayerSave` format doesn't carry them yet. Called out in the panel hint ("Not saved with the project yet") rather than letting a user lose work silently.
+- **A cosmetic subtlety:** the mask `RasterCanvas` is sRGB-encoded, so a feathered mask edge's mid-gray samples through the sRGB→linear curve — the transition is a touch contrastier than a pure-linear ramp. Exact at black/white (the common case); a minor, monotonic bend only on soft edges. Noted, not fixed, for v1.
+
+### Testing
+2 new headless-GPU tests (real shader execution + readback) + everything above stayed green: 99 workspace tests. Clean `cargo build --workspace`, no warnings.
+
+Next: paint-directly-on-mask and mask persistence are the natural S3 follow-ups; also still owed across the session — the eyes-on re-checks (Free-Transform corner-drag, feather slider, and now masks in the live app) once OS Screen Recording capture is back. Note that layer masks are the first of those with a real GPU-execution test behind them, so the live check is confirmation rather than first verification.

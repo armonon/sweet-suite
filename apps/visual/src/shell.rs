@@ -37,6 +37,10 @@ pub enum LayerCmd {
     SetOpacity(usize, f32),
     SetBlend(usize, suite_doc::BlendMode),
     Move(usize, bool),
+    /// S3: add/replace a mask on layer `i` from the current selection.
+    MaskFromSelection(usize),
+    /// S3: remove layer `i`'s mask.
+    ClearMask(usize),
 }
 
 pub struct ShellState {
@@ -747,7 +751,28 @@ pub fn draw_shell(
                                 }
                             });
                     });
+                    // S3: layer mask — add from the current selection, or clear an existing one.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("   mask").color(TEXT_2).small());
+                        if info.has_mask {
+                            ui.label(RichText::new("◧ on").color(TEXT_1).small());
+                            if ui.small_button(RichText::new("Clear").color(TEXT_2)).clicked() {
+                                state.pending_layer_cmd = Some(LayerCmd::ClearMask(i));
+                            }
+                        } else {
+                            let has_sel = state.selection_rect.is_some();
+                            if ui.add_enabled(has_sel, egui::Button::new(RichText::new("From Selection").color(TEXT_0)).small()).clicked() {
+                                state.pending_layer_cmd = Some(LayerCmd::MaskFromSelection(i));
+                            }
+                        }
+                    });
                 }
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new("Mask: make a selection (any tool, feather works), then \"From Selection\" hides everything outside it — non-destructively. Not saved with the project yet, and painting directly on a mask is coming.")
+                        .color(TEXT_2)
+                        .small(),
+                );
 
                 ui.add_space(6.0);
                 ui.separator();

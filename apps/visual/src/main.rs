@@ -1040,6 +1040,20 @@ impl ApplicationHandler for App {
                         shell::LayerCmd::SetOpacity(i, o) => renderer.set_layer_opacity(i, o),
                         shell::LayerCmd::SetBlend(i, b) => renderer.set_layer_blend(i, b),
                         shell::LayerCmd::Move(i, up) => renderer.move_layer(i, up),
+                        shell::LayerCmd::MaskFromSelection(i) => {
+                            // The mask op targets the active layer, so select `i` first.
+                            renderer.set_active_layer(i);
+                            if renderer.set_active_layer_mask_from_selection() {
+                                self.shell.status = "Added layer mask from selection".into();
+                            } else {
+                                self.shell.status = "Make a selection first (mask needs a shape to keep)".into();
+                            }
+                        }
+                        shell::LayerCmd::ClearMask(i) => {
+                            renderer.set_active_layer(i);
+                            renderer.clear_active_layer_mask();
+                            self.shell.status = "Removed layer mask".into();
+                        }
                     }
                     self.shell.dirty = true;
                     window.request_redraw();

@@ -971,6 +971,10 @@ struct PaintLayer {
     visible: bool,
     opacity: f32,
     blend: suite_doc::BlendMode,
+    /// S3: an optional non-destructive layer mask (a grayscale `RasterCanvas`, white=reveal,
+    /// black=hide). `None` = the layer is fully visible per its own alpha (the common case).
+    /// It reuses `RasterCanvas` so the mask gets the whole brush/undo machinery for free.
+    mask: Option<RasterCanvas>,
 }
 
 /// Read-only snapshot of a layer's metadata for the UI (the panel can't touch the GPU).
@@ -980,6 +984,8 @@ pub struct LayerInfo {
     pub visible: bool,
     pub opacity: f32,
     pub blend: suite_doc::BlendMode,
+    /// S3: whether this layer currently has a mask (drives the Layers panel's Mask/Clear button).
+    pub has_mask: bool,
 }
 
 /// Map a blend mode to the shader's `mode` id (matches LAYER_COMPOSITE_WGSL's switch).
@@ -1031,6 +1037,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @group(0) @binding(2) var samp:     sampler;
 struct BlendParams { mode: u32, opacity: f32, _p0: u32, _p1: u32 }
 @group(0) @binding(3) var<uniform> params: BlendParams;
+// S3 (layer masks): a per-layer grayscale mask. white (r=1) = fully reveal, black (r=0) =
+// fully hide; it modulates the layer's source alpha. When a layer has no mask, a 1x1 white
+// texture is bound here, so `m` is 1.0 and the math below is identical to the pre-mask path.
+@group(0) @binding(4) var mask_tex: texture_2d<f32>;
 
 fn overlay_ch(b: f32, s: f32) -> f32 {
     if b < 0.5 { return 2.0 * b * s; }
@@ -1049,6 +1059,7 @@ fn soft_light_ch(b: f32, s: f32) -> f32 {
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let base = textureSample(base_tex, samp, in.uv);
     let src  = textureSample(src_tex,  samp, in.uv);
+    let m    = textureSample(mask_tex, samp, in.uv).r;
     var rgb: vec3<f32>;
     switch params.mode {
         case 1u { rgb = base.rgb * src.rgb; }
@@ -1060,7 +1071,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         case 7u { rgb = clamp(base.rgb - src.rgb, vec3(0.0), vec3(1.0)); }
         default { rgb = src.rgb; }
     }
-    let sa = src.a * params.opacity;
+    let sa = src.a * params.opacity * m;
     let out_a = sa + base.a * (1.0 - sa);
     let out_rgb = select(
         (rgb * sa + base.rgb * base.a * (1.0 - sa)) / out_a,
@@ -1102,6 +1113,10 @@ pub struct Renderer {
     /// opacity, ping-ponging between `comp_a`/`comp_b`. docs/03 §1.7.
     layer_composite_pipeline: wgpu::RenderPipeline,
     layer_composite_layout: wgpu::BindGroupLayout,
+    /// S3: a 1×1 opaque-white texture bound as the mask for layers that have none, so the
+    /// composite shader's `* m` is `* 1.0` — i.e. the no-mask path is identical to pre-S3.
+    _mask_white_tex: wgpu::Texture,
+    mask_white_view: wgpu::TextureView,
     comp_a: wgpu::Texture,
     comp_a_view: wgpu::TextureView,
     comp_b: wgpu::Texture,
@@ -1360,6 +1375,7 @@ impl Renderer {
             visible: true,
             opacity: 1.0,
             blend: suite_doc::BlendMode::Normal,
+            mask: None,
         }];
 
         // Layer-composite pipeline: blends one layer (src) over the running composite
@@ -1421,6 +1437,17 @@ impl Renderer {
                         },
                         count: None,
                     },
+                    // S3: the per-layer mask texture (or a 1x1 white fallback when unmasked).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let layer_composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1432,6 +1459,25 @@ impl Renderer {
             bind_group_layouts: &[Some(&layer_composite_layout)],
             immediate_size: 0,
         });
+
+        // S3: the 1×1 opaque-white mask fallback for unmasked layers (sampled `.r` = 1.0).
+        let mask_white_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("layer mask white fallback"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            mask_white_tex.as_image_copy(),
+            &[255u8, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        let mask_white_view = mask_white_tex.create_view(&Default::default());
         let layer_composite_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("layer composite pipeline"),
@@ -1630,6 +1676,8 @@ impl Renderer {
             active_layer: 0,
             layers_dirty: true,
             layer_composite_pipeline,
+            _mask_white_tex: mask_white_tex,
+            mask_white_view,
             layer_composite_layout,
             comp_a,
             comp_a_view,
@@ -2030,6 +2078,12 @@ impl Renderer {
             } else {
                 (&self.comp_b_view, &self.comp_a_view)
             };
+            // S3: the layer's mask view, or the 1×1 white fallback (→ no masking) when unmasked.
+            let mask_view = self.layers[i]
+                .mask
+                .as_ref()
+                .map(|m| m.texture_view())
+                .unwrap_or(&self.mask_white_view);
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("layer composite bg"),
                 layout: &self.layer_composite_layout,
@@ -2041,6 +2095,7 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
                     wgpu::BindGroupEntry { binding: 3, resource: ubuf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(mask_view) },
                 ],
             });
             {
@@ -2090,8 +2145,65 @@ impl Renderer {
     pub fn layer_infos(&self) -> Vec<LayerInfo> {
         self.layers
             .iter()
-            .map(|l| LayerInfo { name: l.name.clone(), visible: l.visible, opacity: l.opacity, blend: l.blend })
+            .map(|l| LayerInfo { name: l.name.clone(), visible: l.visible, opacity: l.opacity, blend: l.blend, has_mask: l.mask.is_some() })
             .collect()
+    }
+
+    // ---- S3: layer masks --------------------------------------------------------------
+
+    /// Full-canvas coverage mask (one byte/texel) of the *current selection* — the feathered
+    /// exact shape (Ellipse/Lasso/Wand) when present, else a plain white-inside/black-outside
+    /// fill of `selection_rect`. `None` if there's no (or a whole-canvas) selection to mask by.
+    fn selection_coverage_mask(&self, w: usize, h: usize) -> Option<Vec<u8>> {
+        if let Some(mask) = self.current_selection_mask(w, h) {
+            return Some(mask);
+        }
+        // No exact shape → derive from the rect (skip a missing or whole-canvas selection).
+        let [x0, y0, x1, y1] = self.selection_rect?;
+        if x1 <= x0 || y1 <= y0 || (x0 <= 0.0 && y0 <= 0.0 && x1 >= 1.0 && y1 >= 1.0) {
+            return None;
+        }
+        let (sx0, sy0) = ((x0 * w as f32) as usize, (y0 * h as f32) as usize);
+        let (sx1, sy1) = ((x1 * w as f32).ceil() as usize, (y1 * h as f32).ceil() as usize);
+        let mut mask = vec![0u8; w * h];
+        for y in sy0.min(h)..sy1.min(h) {
+            for x in sx0.min(w)..sx1.min(w) {
+                mask[y * w + x] = 255;
+            }
+        }
+        Some(mask)
+    }
+
+    /// **S3: Add/replace a layer mask from the current selection.** The masked-in region stays
+    /// visible; everything outside the selection is hidden (non-destructively — the layer's
+    /// pixels are untouched). Reuses every selection tool + feathering via
+    /// `selection_coverage_mask`. No-op with no active selection. Returns whether a mask was set.
+    pub fn set_active_layer_mask_from_selection(&mut self) -> bool {
+        let (w, h) = (self.layers[self.active_layer].canvas.width() as usize, self.layers[self.active_layer].canvas.height() as usize);
+        let Some(coverage) = self.selection_coverage_mask(w, h) else { return false };
+        // Expand the single-channel coverage into an RGBA canvas the compositor samples `.r` of.
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, &m) in coverage.iter().enumerate() {
+            rgba[i * 4] = m;
+            rgba[i * 4 + 1] = m;
+            rgba[i * 4 + 2] = m;
+            rgba[i * 4 + 3] = 255;
+        }
+        let mut mask_canvas = RasterCanvas::new(&self.device, w as u32, h as u32, [1.0, 1.0, 1.0, 1.0]);
+        mask_canvas.upload_rgba(&self.queue, &rgba);
+        self.layers[self.active_layer].mask = Some(mask_canvas);
+        self.layers_dirty = true;
+        true
+    }
+
+    /// **S3: Remove the active layer's mask** (the layer returns to full visibility). Returns
+    /// whether there was a mask to remove.
+    pub fn clear_active_layer_mask(&mut self) -> bool {
+        let had = self.layers[self.active_layer].mask.take().is_some();
+        if had {
+            self.layers_dirty = true;
+        }
+        had
     }
     pub fn set_layer_blend(&mut self, i: usize, blend: suite_doc::BlendMode) {
         if let Some(l) = self.layers.get_mut(i) {
@@ -2123,7 +2235,7 @@ impl Renderer {
         }
         let idx = self.active_layer + 1;
         let name = format!("Layer {}", self.layers.len() + 1);
-        self.layers.insert(idx, PaintLayer { canvas, name, visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal });
+        self.layers.insert(idx, PaintLayer { canvas, name, visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal, mask: None });
         self.active_layer = idx;
         self.layers_dirty = true;
     }
@@ -2271,7 +2383,7 @@ impl Renderer {
                 canvas.clear(&mut enc);
                 self.queue.submit(Some(enc.finish()));
             }
-            layers.push(PaintLayer { canvas, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend });
+            layers.push(PaintLayer { canvas, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend, mask: None });
         }
         self.layers = layers;
         self.active_layer = 0;
@@ -2309,6 +2421,7 @@ impl Renderer {
             visible: true,
             opacity: 1.0,
             blend: suite_doc::BlendMode::Normal,
+            mask: None,
         }];
         self.active_layer = 0;
         self.layers_dirty = true;
@@ -2355,7 +2468,7 @@ impl Renderer {
             .map(|(pixels, old)| {
                 let mut canvas = RasterCanvas::new(&self.device, new_w, new_h, [0.0, 0.0, 0.0, 0.0]);
                 canvas.upload_rgba(&self.queue, &pixels);
-                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend }
+                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend, mask: None }
             })
             .collect();
         self.layers_dirty = true;
@@ -2573,7 +2686,7 @@ impl Renderer {
             .map(|(pixels, old)| {
                 let mut canvas = RasterCanvas::new(&self.device, new_w, new_h, [0.0, 0.0, 0.0, 0.0]);
                 canvas.upload_rgba(&self.queue, &pixels);
-                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend }
+                PaintLayer { canvas, name: old.name, visible: old.visible, opacity: old.opacity, blend: old.blend, mask: None }
             })
             .collect();
         self.layers_dirty = true;
@@ -4111,5 +4224,181 @@ mod m4_tests {
         // must stay untouched — proving the mask, not just the rect, gates the fill.
         let rect_corner = px(&buf, w, (bounds[0] * w as f32) as usize + 1, (bounds[1] * h as f32) as usize + 1);
         assert_eq!(rect_corner, [0, 0, 0, 255], "bounding-rect corner outside the ellipse stays untouched");
+    }
+}
+
+#[cfg(test)]
+mod layer_mask_gpu_tests {
+    //! Real headless-GPU verification of the S3 layer-mask shader: it runs the *exact*
+    //! `LAYER_COMPOSITE_WGSL` string the app composites with, on real hardware, and reads the
+    //! result back. This is the strongest verification available while live Screen Recording
+    //! is down — it proves the mask actually gates the layer's alpha, not just that the math
+    //! type-checks.
+
+    fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("mask test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            experimental_features: Default::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        }))
+        .ok()
+    }
+
+    fn tex_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, pixels: &[u8]) -> wgpu::Texture {
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Linear (not sRGB) so a sampled byte b reads back as b/255 with no transfer curve —
+            // keeps the test's expected values plain.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            // COPY_SRC so the render target can be read back; harmless on the input textures.
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            t.as_image_copy(),
+            pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        t
+    }
+
+    /// Composite a solid-red top layer over a solid-green base through `mask_pixels`, and read
+    /// back the resulting `W`×1 row. Runs the app's real `LAYER_COMPOSITE_WGSL`.
+    fn composite_row(mask_pixels: &[u8]) -> Option<Vec<[u8; 4]>> {
+        const W: u32 = 4;
+        let (device, queue) = headless()?;
+
+        // Bind layout must match the shader's 5 bindings (base, src, sampler, params, mask).
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(super::LAYER_COMPOSITE_WGSL.into()),
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // green base, red top layer, mask per argument. All opaque.
+        let base = tex_rgba8(&device, &queue, W, 1, &[0, 255, 0, 255].repeat(W as usize));
+        let src = tex_rgba8(&device, &queue, W, 1, &[255, 0, 0, 255].repeat(W as usize));
+        let mask = tex_rgba8(&device, &queue, W, 1, mask_pixels);
+        let target = tex_rgba8(&device, &queue, W, 1, &[0u8; (4 * W) as usize]);
+        let bv = base.create_view(&Default::default());
+        let sv = src.create_view(&Default::default());
+        let mv = mask.create_view(&Default::default());
+        let tv = target.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+
+        // Normal blend (mode 0), opacity 1.0.
+        let params: [u8; 16] = bytemuck::cast([0u32, 1.0f32.to_bits(), 0u32, 0u32]);
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&ubuf, 0, &params);
+
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&bv) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: ubuf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&mv) },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &tv, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            rp.set_pipeline(&pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..4, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+
+        // Read back the 4×1 row (pad row stride to 256).
+        let padded = 256u32;
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: padded as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(1) } },
+            wgpu::Extent3d { width: W, height: 1, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = rb.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        Some((0..W as usize).map(|x| [data[x * 4], data[x * 4 + 1], data[x * 4 + 2], data[x * 4 + 3]]).collect())
+    }
+
+    fn near(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b.iter()).all(|(&x, &y)| (x as i32 - y as i32).abs() <= 2)
+    }
+
+    #[test]
+    fn black_mask_hides_the_layer_white_mask_reveals_it() {
+        // 4-wide mask: left two texels black (hide), right two white (reveal).
+        let mask = [0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255];
+        let Some(row) = composite_row(&mask) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // Left (mask=black): red top layer is fully masked out → the green base shows through.
+        assert!(near(row[0], [0, 255, 0, 255]), "black-masked texel should show the base (green), got {:?}", row[0]);
+        // Right (mask=white): red top layer composites normally over the base → red.
+        assert!(near(row[3], [255, 0, 0, 255]), "white-masked texel should show the top layer (red), got {:?}", row[3]);
+    }
+
+    #[test]
+    fn all_white_mask_is_identical_to_no_mask() {
+        // This is the property the no-mask fallback relies on: binding all-white must be a
+        // no-op, i.e. a plain "red over green" == red everywhere.
+        let mask = [255u8; 16];
+        let Some(row) = composite_row(&mask) else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        for (x, px) in row.iter().enumerate() {
+            assert!(near(*px, [255, 0, 0, 255]), "white mask must be a no-op (red over green = red) at x={x}, got {px:?}");
+        }
     }
 }
