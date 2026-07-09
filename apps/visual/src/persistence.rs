@@ -33,6 +33,8 @@ pub struct LayerSave {
     pub visible: bool,
     pub opacity: f32,
     pub blend: suite_doc::BlendMode,
+    /// S3: the layer's mask RGBA (same dims), or `None` if the layer is unmasked.
+    pub mask: Option<Vec<u8>>,
 }
 
 /// Write the document + the full 2D layer stack to `path` as a `.sweet` bundle. Each layer
@@ -58,6 +60,13 @@ pub fn save_to(doc: &Document, layers: &[LayerSave], path: &Path) -> Result<Stri
                 .map_err(|e| format!("layer {i} encode failed: {e}"))?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
             bundle.put_blob(format!("main.layer.{i}.png"), b64);
+            // S3: a layer's mask (if any) is a sibling blob; absence on load = unmasked.
+            if let Some(mask_rgba) = &l.mask {
+                let mpng = encode_png(&PaintImage { width: l.width, height: l.height, rgba: mask_rgba.clone() })
+                    .map_err(|e| format!("layer {i} mask encode failed: {e}"))?;
+                let mb64 = base64::engine::general_purpose::STANDARD.encode(&mpng);
+                bundle.put_blob(format!("main.layer.{i}.mask.png"), mb64);
+            }
         }
     }
     bundle.save(path).map_err(|e| e.to_string())?;
@@ -126,7 +135,14 @@ fn decode_layer_blob(
         .decode(b64)
         .map_err(|e| format!("{blob_name} base64 decode failed: {e}"))?;
     let img = decode_png(&png).map_err(|e| format!("{blob_name} decode failed: {e}"))?;
-    Ok(Some(LayerSave { rgba: img.rgba, width: img.width, height: img.height, name, visible, opacity, blend }))
+    // S3: a matching `.mask.png` sibling (if present) restores this layer's mask.
+    let mask = blob_name.strip_suffix(".png").and_then(|stem| {
+        let mask_name = format!("{stem}.mask.png");
+        let mb64 = bundle.blob(&mask_name)?;
+        let mpng = base64::engine::general_purpose::STANDARD.decode(mb64).ok()?;
+        decode_png(&mpng).ok().map(|m| m.rgba)
+    });
+    Ok(Some(LayerSave { rgba: img.rgba, width: img.width, height: img.height, name, visible, opacity, blend, mask }))
 }
 
 /// Load a `.sweet` bundle from `path`. Fail-closed on a foreign file, a future
@@ -297,8 +313,9 @@ mod tests {
             v
         };
         let layers = vec![
-            LayerSave { rgba: make([10, 20, 30, 255]), width: size, height: size, name: "Background".into(), visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal },
-            LayerSave { rgba: make([200, 100, 50, 128]), width: size, height: size, name: "Layer 2".into(), visible: false, opacity: 0.5, blend: suite_doc::BlendMode::Multiply },
+            LayerSave { rgba: make([10, 20, 30, 255]), width: size, height: size, name: "Background".into(), visible: true, opacity: 1.0, blend: suite_doc::BlendMode::Normal, mask: None },
+            // S3: Layer 2 carries a mask (half black, half white) to prove masks round-trip.
+            LayerSave { rgba: make([200, 100, 50, 128]), width: size, height: size, name: "Layer 2".into(), visible: false, opacity: 0.5, blend: suite_doc::BlendMode::Multiply, mask: Some(make([0, 0, 0, 255])) },
         ];
 
         let path = std::env::temp_dir().join("sweet-visual-layers-roundtrip.sweet");
@@ -309,12 +326,16 @@ mod tests {
         assert_eq!(loaded.layers.len(), 2, "both layers survive");
         assert_eq!(loaded.layers[0].name, "Background");
         assert_eq!(&loaded.layers[0].rgba[0..4], &[10, 20, 30, 255]);
+        assert!(loaded.layers[0].mask.is_none(), "an unmasked layer stays unmasked");
         // Metadata + pixels of the second layer survive.
         assert_eq!(loaded.layers[1].name, "Layer 2");
         assert!(!loaded.layers[1].visible);
         assert!((loaded.layers[1].opacity - 0.5).abs() < 1e-4);
         assert_eq!(loaded.layers[1].blend, suite_doc::BlendMode::Multiply, "blend mode survives");
         assert_eq!(&loaded.layers[1].rgba[0..4], &[200, 100, 50, 128]);
+        // S3: the mask survives the round-trip (pixels intact).
+        let m = loaded.layers[1].mask.as_ref().expect("Layer 2's mask survives");
+        assert_eq!(&m[0..4], &[0, 0, 0, 255], "mask pixels round-trip");
         let _ = std::fs::remove_file(&path);
     }
 

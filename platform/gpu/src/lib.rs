@@ -1015,6 +1015,8 @@ pub struct LoadedLayer {
     pub visible: bool,
     pub opacity: f32,
     pub blend: suite_doc::BlendMode,
+    /// S3: the layer's mask RGBA (same dims), or `None` if unmasked.
+    pub mask: Option<Vec<u8>>,
 }
 
 /// Composites one layer (`src`) over the running result (`base`) with a blend mode +
@@ -1169,6 +1171,10 @@ pub struct Renderer {
     /// rasterized mask's edge by this much before any tool applies it. Kept in sync from the
     /// shell's inspector slider.
     pub selection_feather: f32,
+    /// S3: when `true` (and the active layer has a mask), the brush paints onto that layer's
+    /// **mask** instead of its colour — paint black to hide, white to reveal. `false` (the
+    /// default) paints colour as before. Synced from the Layers panel's Layer/Mask toggle.
+    pub mask_edit: bool,
 }
 
 impl Renderer {
@@ -1702,6 +1708,7 @@ impl Renderer {
             selection_rect: None,
             selection_extra: None,
             selection_feather: 0.0,
+            mask_edit: false,
         }
     }
 
@@ -1764,6 +1771,12 @@ impl Renderer {
     /// Stamp a brush segment from `from_uv` to `to_uv`. `pressure` in [0,1] scales radius
     /// (by sqrt) and flow linearly — 1.0 is full/mouse pressure.
     /// When `self.selection_rect` is set, stamps are clipped to that region.
+    /// S3: are brush/undo ops currently targeting the active layer's **mask** (not its colour)?
+    /// True only when mask-edit is on *and* the active layer actually has a mask.
+    fn painting_mask(&self) -> bool {
+        self.mask_edit && self.layers[self.active_layer].mask.is_some()
+    }
+
     pub fn paint_stamp(
         &mut self,
         from_uv: [f32; 2],
@@ -1787,9 +1800,14 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("paint stamp enc"),
             });
-        self.layers[self.active_layer]
-            .canvas
-            .stamp_segment(&self.device, &mut enc, from_uv, to_uv, &effective, scissor);
+        let ai = self.active_layer;
+        let to_mask = self.painting_mask();
+        let target = if to_mask {
+            self.layers[ai].mask.as_mut().unwrap()
+        } else {
+            &mut self.layers[ai].canvas
+        };
+        target.stamp_segment(&self.device, &mut enc, from_uv, to_uv, &effective, scissor);
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = true;
     }
@@ -1873,49 +1891,67 @@ impl Renderer {
             let c = &self.layers[self.active_layer].canvas;
             (c.width() as usize, c.height() as usize)
         };
+        // S3: route the stroke-end (and its selection masking + undo capture) to whichever
+        // canvas the brush just painted — the mask when mask-editing, else the colour.
+        let ai = self.active_layer;
+        let to_mask = self.painting_mask();
         match self.current_selection_mask(w, h) {
             Some(mask) => {
-                self.layers[self.active_layer].canvas.end_stroke_masked(
-                    &self.device, &self.queue, &mut enc, &mask, w,
-                );
+                let target = if to_mask { self.layers[ai].mask.as_mut().unwrap() } else { &mut self.layers[ai].canvas };
+                target.end_stroke_masked(&self.device, &self.queue, &mut enc, &mask, w);
             }
             None => {
-                self.layers[self.active_layer].canvas.end_stroke(&self.device, &mut enc);
+                let target = if to_mask { self.layers[ai].mask.as_mut().unwrap() } else { &mut self.layers[ai].canvas };
+                target.end_stroke(&self.device, &mut enc);
             }
         }
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = true;
     }
 
-    /// Undo the last paint stroke / clear on the active layer. Returns whether changed.
+    /// Undo the last paint stroke / clear on the active layer (its mask when mask-editing).
     pub fn paint_undo(&mut self) -> bool {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("paint undo enc"),
             });
-        let changed = self.layers[self.active_layer].canvas.undo(&self.device, &mut enc);
+        let ai = self.active_layer;
+        let to_mask = self.painting_mask();
+        let target = if to_mask { self.layers[ai].mask.as_mut().unwrap() } else { &mut self.layers[ai].canvas };
+        let changed = target.undo(&self.device, &mut enc);
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = true;
         changed
     }
-    /// Redo the last undone paint change on the active layer.
+    /// Redo the last undone paint change on the active layer (its mask when mask-editing).
     pub fn paint_redo(&mut self) -> bool {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("paint redo enc"),
             });
-        let changed = self.layers[self.active_layer].canvas.redo(&self.device, &mut enc);
+        let ai = self.active_layer;
+        let to_mask = self.painting_mask();
+        let target = if to_mask { self.layers[ai].mask.as_mut().unwrap() } else { &mut self.layers[ai].canvas };
+        let changed = target.redo(&self.device, &mut enc);
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = true;
         changed
     }
     pub fn paint_can_undo(&self) -> bool {
-        self.layers[self.active_layer].canvas.can_undo()
+        if self.painting_mask() {
+            self.layers[self.active_layer].mask.as_ref().unwrap().can_undo()
+        } else {
+            self.layers[self.active_layer].canvas.can_undo()
+        }
     }
     pub fn paint_can_redo(&self) -> bool {
-        self.layers[self.active_layer].canvas.can_redo()
+        if self.painting_mask() {
+            self.layers[self.active_layer].mask.as_ref().unwrap().can_redo()
+        } else {
+            self.layers[self.active_layer].canvas.can_redo()
+        }
     }
 
     /// Wipe the active layer back to paper (undoable).
@@ -2196,6 +2232,20 @@ impl Renderer {
         true
     }
 
+    /// **S3: Add an empty (all-white → reveal-all) mask** on the active layer, so the user can
+    /// paint black into it to carve holes. No-op if the layer already has a mask.
+    pub fn add_active_layer_mask(&mut self) {
+        if self.layers[self.active_layer].mask.is_some() {
+            return;
+        }
+        let (w, h) = (self.layers[self.active_layer].canvas.width(), self.layers[self.active_layer].canvas.height());
+        // Opaque white: `.r` = 1.0 everywhere → the layer is fully revealed until painted on.
+        let mut mask_canvas = RasterCanvas::new(&self.device, w, h, [1.0, 1.0, 1.0, 1.0]);
+        mask_canvas.upload_rgba(&self.queue, &[255u8; 4].repeat((w * h) as usize));
+        self.layers[self.active_layer].mask = Some(mask_canvas);
+        self.layers_dirty = true;
+    }
+
     /// **S3: Remove the active layer's mask** (the layer returns to full visibility). Returns
     /// whether there was a mask to remove.
     pub fn clear_active_layer_mask(&mut self) -> bool {
@@ -2204,6 +2254,11 @@ impl Renderer {
             self.layers_dirty = true;
         }
         had
+    }
+
+    /// S3: whether the active layer has a mask (for the UI's Layer/Mask edit toggle).
+    pub fn active_layer_has_mask(&self) -> bool {
+        self.layers[self.active_layer].mask.is_some()
     }
     pub fn set_layer_blend(&mut self, i: usize, blend: suite_doc::BlendMode) {
         if let Some(l) = self.layers.get_mut(i) {
@@ -2284,10 +2339,20 @@ impl Renderer {
     /// Read back layer `i`'s raw RGBA8 pixels (the layer itself, not the composite) — used
     /// by save. Blocking. Empty if `i` is out of range.
     pub fn layer_pixels(&self, i: usize) -> Vec<u8> {
-        let canvas = match self.layers.get(i) {
-            Some(l) => &l.canvas,
-            None => return Vec::new(),
-        };
+        match self.layers.get(i) {
+            Some(l) => self.readback_canvas(&l.canvas),
+            None => Vec::new(),
+        }
+    }
+
+    /// S3: read back layer `i`'s **mask** pixels for saving (`None` = the layer is unmasked).
+    pub fn layer_mask_pixels(&self, i: usize) -> Option<Vec<u8>> {
+        let mask = self.layers.get(i)?.mask.as_ref()?;
+        Some(self.readback_canvas(mask))
+    }
+
+    /// Blocking GPU→CPU full readback of a `RasterCanvas`'s RGBA8 pixels (row-major, top-left).
+    fn readback_canvas(&self, canvas: &RasterCanvas) -> Vec<u8> {
         let (w, h) = (canvas.width(), canvas.height());
         let bpr = w * 4;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2383,7 +2448,18 @@ impl Renderer {
                 canvas.clear(&mut enc);
                 self.queue.submit(Some(enc.finish()));
             }
-            layers.push(PaintLayer { canvas, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend, mask: None });
+            // S3: restore a saved mask (only if it matches the document dims — a corrupt or
+            // wrong-size mask blob is dropped, same defensive posture as the layer pixels).
+            let mask = l.mask.and_then(|m| {
+                if m.len() == expected && l.width == doc_w && l.height == doc_h {
+                    let mut mc = RasterCanvas::new(&self.device, doc_w, doc_h, [1.0, 1.0, 1.0, 1.0]);
+                    mc.upload_rgba(&self.queue, &m);
+                    Some(mc)
+                } else {
+                    None
+                }
+            });
+            layers.push(PaintLayer { canvas, name: l.name, visible: l.visible, opacity: l.opacity, blend: l.blend, mask });
         }
         self.layers = layers;
         self.active_layer = 0;

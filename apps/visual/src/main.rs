@@ -172,6 +172,7 @@ impl App {
                 visible: infos[i].visible,
                 opacity: infos[i].opacity,
                 blend: infos[i].blend,
+                mask: r.layer_mask_pixels(i),
             })
             .collect()
     }
@@ -216,6 +217,7 @@ impl App {
                                         visible: l.visible,
                                         opacity: l.opacity,
                                         blend: l.blend,
+                                        mask: l.mask,
                                     })
                                     .collect();
                                 r.replace_layers(layers);
@@ -994,6 +996,9 @@ impl ApplicationHandler for App {
                 // Tier 1: feather radius is inspector-owned → push it to the renderer, which
                 // applies it when it rasterizes the selection mask.
                 renderer.selection_feather = self.shell.selection_feather;
+                // S3: push the mask-edit toggle (the renderer falls back to colour if the
+                // active layer has no mask, so an out-of-sync `true` is harmless).
+                renderer.mask_edit = self.shell.mask_edit;
                 // Gradient guide line: input → shell so the overlay can draw the drag.
                 self.shell.gradient_preview = self.input.gradient_preview;
                 // Move guide line: same sync.
@@ -1049,9 +1054,15 @@ impl ApplicationHandler for App {
                                 self.shell.status = "Make a selection first (mask needs a shape to keep)".into();
                             }
                         }
+                        shell::LayerCmd::AddEmptyMask(i) => {
+                            renderer.set_active_layer(i);
+                            renderer.add_active_layer_mask();
+                            self.shell.status = "Added blank layer mask — paint black to hide".into();
+                        }
                         shell::LayerCmd::ClearMask(i) => {
                             renderer.set_active_layer(i);
                             renderer.clear_active_layer_mask();
+                            self.shell.mask_edit = false; // no mask left to paint
                             self.shell.status = "Removed layer mask".into();
                         }
                     }

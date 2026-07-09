@@ -39,6 +39,8 @@ pub enum LayerCmd {
     Move(usize, bool),
     /// S3: add/replace a mask on layer `i` from the current selection.
     MaskFromSelection(usize),
+    /// S3: add an empty (white, reveal-all) mask on layer `i` to paint holes into.
+    AddEmptyMask(usize),
     /// S3: remove layer `i`'s mask.
     ClearMask(usize),
 }
@@ -90,6 +92,10 @@ pub struct ShellState {
     /// Tier 1: selection feather radius in canvas texels (0 = hard edge). Synced to
     /// `Renderer::selection_feather`; softens the selection's edge for Paint/Gradient/Move/Text.
     pub selection_feather: f32,
+    /// S3: when true, the brush paints the active layer's mask (black hides, white reveals)
+    /// instead of its colour. Synced to `Renderer::mask_edit`. Only meaningful when the active
+    /// layer has a mask (the renderer falls back to colour otherwise).
+    pub mask_edit: bool,
     /// Set when the user clicks "→ 3D Heightmap" on a paint canvas. main.rs drains this.
     pub pending_heightmap: bool,
     /// Heightmap settings.
@@ -195,6 +201,7 @@ impl Default for ShellState {
             sculpt_strength: 0.05,
             magic_wand_tolerance: 0.1,
             selection_feather: 0.0,
+            mask_edit: false,
             pending_heightmap: false,
             heightmap_resolution: 64,
             heightmap_scale: 0.5,
@@ -751,25 +758,39 @@ pub fn draw_shell(
                                 }
                             });
                     });
-                    // S3: layer mask — add from the current selection, or clear an existing one.
+                    // S3: layer mask — add (from selection or empty), clear, or (active layer)
+                    // toggle whether the brush paints the colour or the mask.
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("   mask").color(TEXT_2).small());
                         if info.has_mask {
-                            ui.label(RichText::new("◧ on").color(TEXT_1).small());
                             if ui.small_button(RichText::new("Clear").color(TEXT_2)).clicked() {
                                 state.pending_layer_cmd = Some(LayerCmd::ClearMask(i));
                             }
+                            // The Layer/Mask paint target is a property of the active layer.
+                            if is_active {
+                                if ui.selectable_label(!state.mask_edit, RichText::new("Paint Layer").color(TEXT_1).small()).clicked() {
+                                    state.mask_edit = false;
+                                }
+                                if ui.selectable_label(state.mask_edit, RichText::new("Paint Mask").color(TEXT_1).small()).clicked() {
+                                    state.mask_edit = true;
+                                }
+                            } else {
+                                ui.label(RichText::new("◧ on").color(TEXT_2).small());
+                            }
                         } else {
                             let has_sel = state.selection_rect.is_some();
-                            if ui.add_enabled(has_sel, egui::Button::new(RichText::new("From Selection").color(TEXT_0)).small()).clicked() {
+                            if ui.add_enabled(has_sel, egui::Button::new(RichText::new("From Sel").color(TEXT_0)).small()).clicked() {
                                 state.pending_layer_cmd = Some(LayerCmd::MaskFromSelection(i));
+                            }
+                            if ui.small_button(RichText::new("Add").color(TEXT_0)).clicked() {
+                                state.pending_layer_cmd = Some(LayerCmd::AddEmptyMask(i));
                             }
                         }
                     });
                 }
                 ui.add_space(2.0);
                 ui.label(
-                    RichText::new("Mask: make a selection (any tool, feather works), then \"From Selection\" hides everything outside it — non-destructively. Not saved with the project yet, and painting directly on a mask is coming.")
+                    RichText::new("Mask (non-destructive): \"From Sel\" keeps only the selection (feather works); \"Add\" makes a blank mask. Then pick \"Paint Mask\" and brush black to hide / white to reveal. Saved with the project.")
                         .color(TEXT_2)
                         .small(),
                 );

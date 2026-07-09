@@ -1555,3 +1555,23 @@ This is the part I flagged to Armon as the reason S3 was blocked, so it's the pa
 2 new headless-GPU tests (real shader execution + readback) + everything above stayed green: 99 workspace tests. Clean `cargo build --workspace`, no warnings.
 
 Next: paint-directly-on-mask and mask persistence are the natural S3 follow-ups; also still owed across the session — the eyes-on re-checks (Free-Transform corner-drag, feather slider, and now masks in the live app) once OS Screen Recording capture is back. Note that layer masks are the first of those with a real GPU-execution test behind them, so the live check is confirmation rather than first verification.
+
+---
+
+## Tier 1 S3 follow-ups: paint-on-mask + mask persistence — 2026-07-07
+
+Armon: "do the natural follow up" — closed the two gaps S3 v1 had explicitly deferred (and flagged in the panel), so layer masks are now a complete feature rather than a create-from-selection-only stub.
+
+### Paint directly on the mask
+A `mask_edit` flag on the Renderer routes the brush — and its stroke-end selection-masking, undo, and redo — to the active layer's *mask* `RasterCanvas` instead of its colour, via a `painting_mask()` guard (`mask_edit && the layer actually has a mask`). Because the mask is itself a `RasterCanvas`, this is pure routing: the brush/undo machinery is exactly the tested code that already paints layers, just pointed at a different canvas. Paint black to hide, white to reveal.
+
+The routing is inlined at each paint site (`paint_stamp`/`end_stroke`/`undo`/`redo`/`can_undo`/`can_redo`) rather than behind a `&mut self` helper, on purpose: a helper returning `&mut RasterCanvas` would borrow all of `self`, conflicting with the `&self.device`/`&self.queue` those calls also need — the disjoint-field borrow only type-checks when the target selection is inline. UI: a per-active-layer "Paint Layer / Paint Mask" toggle in the Layers panel, plus an "Add" button for a blank (white, reveal-all) mask to carve holes into. `mask_edit` is guarded so an out-of-sync `true` (e.g. after switching to an unmasked layer) harmlessly falls back to painting colour.
+
+### Mask persistence
+Masks now round-trip through `.sweet`. Each masked layer writes a sibling `main.layer.{i}.mask.png` blob next to its colour PNG; absence on load = unmasked (so old projects load unchanged, and it's forward/backward compatible without a version bump). Threaded through the whole chain: `LayerSave.mask`/`LoadedLayer.mask: Option<Vec<u8>>`, a `Renderer::layer_mask_pixels` readback (refactored the existing `layer_pixels` into a shared `readback_canvas` helper so there's one readback path, not two), and `replace_layers` rebuilding the mask canvas — with the same defensive "drop a wrong-size blob" guard the colour path already uses.
+
+### Testing
+The existing `scene_and_layers_round_trip_through_a_bundle` persistence test now gives a layer a half-black mask and asserts it survives save→load intact (and that an unmasked layer stays unmasked) — so mask persistence is covered by a real round-trip test, not just wired. The paint-on-mask routing is app-glue over the already-GPU-tested brush + already-GPU-tested mask compositor, so it leans on those rather than a new test. 99 workspace tests green, no warnings, packaged clean.
+
+### State of S3
+Layer masks are now feature-complete for v1: create from selection (feather-aware), create blank, paint directly (black hides / white reveals), clear, and save/load. The GPU compositor test from the core S3 entry still backs the "does masking actually work" claim on real hardware. Remaining polish (not blocking): a mask thumbnail in the panel, and the sRGB-sampling nonlinearity on soft mask edges noted in the core entry. Live eyes-on of the full author→paint→save→reload loop is still owed once Screen Recording is back, but every load-bearing piece has an automated test behind it now.
