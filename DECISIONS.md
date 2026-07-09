@@ -1575,3 +1575,17 @@ The existing `scene_and_layers_round_trip_through_a_bundle` persistence test now
 
 ### State of S3
 Layer masks are now feature-complete for v1: create from selection (feather-aware), create blank, paint directly (black hides / white reveals), clear, and save/load. The GPU compositor test from the core S3 entry still backs the "does masking actually work" claim on real hardware. Remaining polish (not blocking): a mask thumbnail in the panel, and the sRGB-sampling nonlinearity on soft mask edges noted in the core entry. Live eyes-on of the full author→paint→save→reload loop is still owed once Screen Recording is back, but every load-bearing piece has an automated test behind it now.
+
+---
+
+## Parity — blend modes (8 → 20) — 2026-07-07
+
+Armon: "add all" — kicked off working through the Photoshop/GIMP parity matrix. Started with the cleanest high-value, fully-GPU-verifiable item: filling out the layer blend modes.
+
+Added the twelve standard *separable* (per-channel) modes SWEET lacked — Darken, Lighten, Color Dodge, Color Burn, Linear Burn, Difference, Exclusion, Divide, Vivid/Linear/Pin Light, Hard Mix — taking the set from 8 to 20. Appended to `suite_doc::BlendMode` (serde tags by name, so old projects load unchanged), mapped in `blend_mode_u32`, and implemented as `switch` cases 8–19 in **both** shader copies (`LAYER_COMPOSITE_WGSL`, the app's real path, and `compositor.rs::BLEND_WGSL`, kept in sync) with shared `cdodge_ch`/`cburn_ch`/`vivid_ch`/`pin_ch` helpers. The Layers panel dropdown picks them all up automatically via `BlendMode::all()`.
+
+**Verified on real hardware:** extended `layer_mask_gpu_tests` (parameterized `composite_row` by mode) to run Darken/Lighten/Difference/Exclusion through the actual shipped shader and assert the pixels — Darken(green,red)=black, Lighten=Difference=Exclusion=yellow. Real GPU execution, not math-on-paper.
+
+**Documented consistency choice:** these blend in the compositor's **linear** space (sRGB textures auto-decode on sample), matching SWEET's existing eight — so they're internally consistent but not pixel-identical to Photoshop's gamma-space blends. Re-architecting the whole compositor to gamma-space blending would change the existing modes too; not worth it for parity-of-capability. The remaining PS modes are the non-separable HSL set (Hue/Saturation/Color/Luminosity) + Darker/Lighter Color, which need whole-pixel (not per-channel) math — a separate, later add.
+
+101 workspace tests green (1 new GPU test). No warnings.

@@ -1000,6 +1000,18 @@ fn blend_mode_u32(m: suite_doc::BlendMode) -> u32 {
         HardLight => 5,
         Add => 6,
         Subtract => 7,
+        Darken => 8,
+        Lighten => 9,
+        ColorDodge => 10,
+        ColorBurn => 11,
+        LinearBurn => 12,
+        Difference => 13,
+        Exclusion => 14,
+        Divide => 15,
+        VividLight => 16,
+        LinearLight => 17,
+        PinLight => 18,
+        HardMix => 19,
     }
 }
 
@@ -1056,6 +1068,10 @@ fn soft_light_ch(b: f32, s: f32) -> f32 {
     else        { d = sqrt(b); }
     return b + (2.0 * s - 1.0) * (d - b);
 }
+fn cdodge_ch(b: f32, s: f32) -> f32 { if s >= 1.0 { return 1.0; } return min(1.0, b / (1.0 - s)); }
+fn cburn_ch(b: f32, s: f32) -> f32 { if s <= 0.0 { return 0.0; } return 1.0 - min(1.0, (1.0 - b) / s); }
+fn vivid_ch(b: f32, s: f32) -> f32 { if s <= 0.5 { return cburn_ch(b, 2.0 * s); } return cdodge_ch(b, 2.0 * (s - 0.5)); }
+fn pin_ch(b: f32, s: f32) -> f32 { if s <= 0.5 { return min(b, 2.0 * s); } return max(b, 2.0 * s - 1.0); }
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
@@ -1071,6 +1087,18 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         case 5u { rgb = vec3(hard_light_ch(base.r, src.r), hard_light_ch(base.g, src.g), hard_light_ch(base.b, src.b)); }
         case 6u { rgb = clamp(base.rgb + src.rgb, vec3(0.0), vec3(1.0)); }
         case 7u { rgb = clamp(base.rgb - src.rgb, vec3(0.0), vec3(1.0)); }
+        case 8u { rgb = min(base.rgb, src.rgb); }
+        case 9u { rgb = max(base.rgb, src.rgb); }
+        case 10u { rgb = vec3(cdodge_ch(base.r, src.r), cdodge_ch(base.g, src.g), cdodge_ch(base.b, src.b)); }
+        case 11u { rgb = vec3(cburn_ch(base.r, src.r), cburn_ch(base.g, src.g), cburn_ch(base.b, src.b)); }
+        case 12u { rgb = clamp(base.rgb + src.rgb - 1.0, vec3(0.0), vec3(1.0)); }
+        case 13u { rgb = abs(base.rgb - src.rgb); }
+        case 14u { rgb = base.rgb + src.rgb - 2.0 * base.rgb * src.rgb; }
+        case 15u { rgb = clamp(base.rgb / max(src.rgb, vec3(1e-4)), vec3(0.0), vec3(1.0)); }
+        case 16u { rgb = vec3(vivid_ch(base.r, src.r), vivid_ch(base.g, src.g), vivid_ch(base.b, src.b)); }
+        case 17u { rgb = clamp(base.rgb + 2.0 * src.rgb - 1.0, vec3(0.0), vec3(1.0)); }
+        case 18u { rgb = vec3(pin_ch(base.r, src.r), pin_ch(base.g, src.g), pin_ch(base.b, src.b)); }
+        case 19u { rgb = vec3(select(0.0, 1.0, vivid_ch(base.r, src.r) >= 0.5), select(0.0, 1.0, vivid_ch(base.g, src.g) >= 0.5), select(0.0, 1.0, vivid_ch(base.b, src.b) >= 0.5)); }
         default { rgb = src.rgb; }
     }
     let sa = src.a * params.opacity * m;
@@ -4356,6 +4384,11 @@ mod layer_mask_gpu_tests {
     /// Composite a solid-red top layer over a solid-green base through `mask_pixels`, and read
     /// back the resulting `W`×1 row. Runs the app's real `LAYER_COMPOSITE_WGSL`.
     fn composite_row(mask_pixels: &[u8]) -> Option<Vec<[u8; 4]>> {
+        composite_row_mode(mask_pixels, 0)
+    }
+
+    /// As `composite_row` but with an explicit blend-mode id (see `blend_mode_u32`).
+    fn composite_row_mode(mask_pixels: &[u8], mode: u32) -> Option<Vec<[u8; 4]>> {
         const W: u32 = 4;
         let (device, queue) = headless()?;
 
@@ -4399,7 +4432,7 @@ mod layer_mask_gpu_tests {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
 
         // Normal blend (mode 0), opacity 1.0.
-        let params: [u8; 16] = bytemuck::cast([0u32, 1.0f32.to_bits(), 0u32, 0u32]);
+        let params: [u8; 16] = bytemuck::cast([mode, 1.0f32.to_bits(), 0u32, 0u32]);
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         queue.write_buffer(&ubuf, 0, &params);
 
@@ -4476,5 +4509,25 @@ mod layer_mask_gpu_tests {
         for (x, px) in row.iter().enumerate() {
             assert!(near(*px, [255, 0, 0, 255]), "white mask must be a no-op (red over green = red) at x={x}, got {px:?}");
         }
+    }
+
+    #[test]
+    fn new_blend_modes_produce_correct_pixels() {
+        // Red (top) over green (base), opaque, white mask → the blend result IS the output.
+        // Verifies the parity blend-mode cases actually run the right per-channel math on GPU.
+        let white = [255u8; 16];
+        // Darken = min(green,red) per channel = min([0,1,0],[1,0,0]) = black.
+        if let Some(row) = composite_row_mode(&white, 8) {
+            assert!(near(row[0], [0, 0, 0, 255]), "Darken(green,red) should be black, got {:?}", row[0]);
+        } else { eprintln!("skipping: no GPU adapter"); return; }
+        // Lighten = max(...) = [1,1,0] = yellow.
+        let row = composite_row_mode(&white, 9).unwrap();
+        assert!(near(row[0], [255, 255, 0, 255]), "Lighten(green,red) should be yellow, got {:?}", row[0]);
+        // Difference = |green-red| = [1,1,0] = yellow.
+        let row = composite_row_mode(&white, 13).unwrap();
+        assert!(near(row[0], [255, 255, 0, 255]), "Difference(green,red) should be yellow, got {:?}", row[0]);
+        // Exclusion = b+s-2bs; with b=[0,1,0], s=[1,0,0] → [1,1,0] = yellow.
+        let row = composite_row_mode(&white, 14).unwrap();
+        assert!(near(row[0], [255, 255, 0, 255]), "Exclusion(green,red) should be yellow, got {:?}", row[0]);
     }
 }

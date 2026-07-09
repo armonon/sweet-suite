@@ -86,6 +86,21 @@ pub enum BlendMode {
     HardLight,
     Add,
     Subtract,
+    // Appended for parity (all separable, per-channel — the shader ids in
+    // `blend_mode_u32`/`LAYER_COMPOSITE_WGSL` continue from Subtract=7). Serde tags by
+    // variant name, so old projects (which only reference the first eight) load unchanged.
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    LinearBurn,
+    Difference,
+    Exclusion,
+    Divide,
+    VividLight,
+    LinearLight,
+    PinLight,
+    HardMix,
 }
 
 impl BlendMode {
@@ -97,8 +112,20 @@ impl BlendMode {
             Self::Overlay => "Overlay",
             Self::SoftLight => "Soft Light",
             Self::HardLight => "Hard Light",
-            Self::Add => "Add",
+            Self::Add => "Linear Dodge (Add)",
             Self::Subtract => "Subtract",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::ColorDodge => "Color Dodge",
+            Self::ColorBurn => "Color Burn",
+            Self::LinearBurn => "Linear Burn",
+            Self::Difference => "Difference",
+            Self::Exclusion => "Exclusion",
+            Self::Divide => "Divide",
+            Self::VividLight => "Vivid Light",
+            Self::LinearLight => "Linear Light",
+            Self::PinLight => "Pin Light",
+            Self::HardMix => "Hard Mix",
         }
     }
     pub fn all() -> &'static [BlendMode] {
@@ -111,6 +138,18 @@ impl BlendMode {
             Self::HardLight,
             Self::Add,
             Self::Subtract,
+            Self::Darken,
+            Self::Lighten,
+            Self::ColorDodge,
+            Self::ColorBurn,
+            Self::LinearBurn,
+            Self::Difference,
+            Self::Exclusion,
+            Self::Divide,
+            Self::VividLight,
+            Self::LinearLight,
+            Self::PinLight,
+            Self::HardMix,
         ]
     }
 }

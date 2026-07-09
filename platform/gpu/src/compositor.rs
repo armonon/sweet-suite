@@ -24,6 +24,19 @@ fn blend_mode_const(m: BlendMode) -> u32 {
         BlendMode::HardLight => MODE_HARD_LIGHT,
         BlendMode::Add => MODE_ADD,
         BlendMode::Subtract => MODE_SUBTRACT,
+        // Parity modes (ids match LAYER_COMPOSITE_WGSL / BLEND_WGSL cases 8–19).
+        BlendMode::Darken => 8,
+        BlendMode::Lighten => 9,
+        BlendMode::ColorDodge => 10,
+        BlendMode::ColorBurn => 11,
+        BlendMode::LinearBurn => 12,
+        BlendMode::Difference => 13,
+        BlendMode::Exclusion => 14,
+        BlendMode::Divide => 15,
+        BlendMode::VividLight => 16,
+        BlendMode::LinearLight => 17,
+        BlendMode::PinLight => 18,
+        BlendMode::HardMix => 19,
     }
 }
 
@@ -75,6 +88,10 @@ fn soft_light_ch(b: f32, s: f32) -> f32 {
     else        { d = sqrt(b); }
     return b + (2.0 * s - 1.0) * (d - b);
 }
+fn cdodge_ch(b: f32, s: f32) -> f32 { if s >= 1.0 { return 1.0; } return min(1.0, b / (1.0 - s)); }
+fn cburn_ch(b: f32, s: f32) -> f32 { if s <= 0.0 { return 0.0; } return 1.0 - min(1.0, (1.0 - b) / s); }
+fn vivid_ch(b: f32, s: f32) -> f32 { if s <= 0.5 { return cburn_ch(b, 2.0 * s); } return cdodge_ch(b, 2.0 * (s - 0.5)); }
+fn pin_ch(b: f32, s: f32) -> f32 { if s <= 0.5 { return min(b, 2.0 * s); } return max(b, 2.0 * s - 1.0); }
 
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -90,6 +107,18 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
         case 5u { rgb = vec3(hard_light_ch(base.r, src.r), hard_light_ch(base.g, src.g), hard_light_ch(base.b, src.b)); } // Hard Light
         case 6u { rgb = clamp(base.rgb + src.rgb, vec3(0.0), vec3(1.0)); } // Add
         case 7u { rgb = clamp(base.rgb - src.rgb, vec3(0.0), vec3(1.0)); } // Subtract
+        case 8u { rgb = min(base.rgb, src.rgb); }          // Darken
+        case 9u { rgb = max(base.rgb, src.rgb); }          // Lighten
+        case 10u { rgb = vec3(cdodge_ch(base.r, src.r), cdodge_ch(base.g, src.g), cdodge_ch(base.b, src.b)); } // Color Dodge
+        case 11u { rgb = vec3(cburn_ch(base.r, src.r), cburn_ch(base.g, src.g), cburn_ch(base.b, src.b)); }    // Color Burn
+        case 12u { rgb = clamp(base.rgb + src.rgb - 1.0, vec3(0.0), vec3(1.0)); }  // Linear Burn
+        case 13u { rgb = abs(base.rgb - src.rgb); }        // Difference
+        case 14u { rgb = base.rgb + src.rgb - 2.0 * base.rgb * src.rgb; } // Exclusion
+        case 15u { rgb = clamp(base.rgb / max(src.rgb, vec3(1e-4)), vec3(0.0), vec3(1.0)); } // Divide
+        case 16u { rgb = vec3(vivid_ch(base.r, src.r), vivid_ch(base.g, src.g), vivid_ch(base.b, src.b)); }   // Vivid Light
+        case 17u { rgb = clamp(base.rgb + 2.0 * src.rgb - 1.0, vec3(0.0), vec3(1.0)); } // Linear Light
+        case 18u { rgb = vec3(pin_ch(base.r, src.r), pin_ch(base.g, src.g), pin_ch(base.b, src.b)); }         // Pin Light
+        case 19u { rgb = vec3(select(0.0, 1.0, vivid_ch(base.r, src.r) >= 0.5), select(0.0, 1.0, vivid_ch(base.g, src.g) >= 0.5), select(0.0, 1.0, vivid_ch(base.b, src.b) >= 0.5)); } // Hard Mix
         default { rgb = src.rgb; }                          // Normal
     }
 
