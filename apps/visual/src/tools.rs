@@ -919,7 +919,7 @@ pub fn handle_left_press(
             // reusable mask selection, not a direct paint — Paint/Gradient/Move afterward
             // respect it exactly, same as an Ellipse/Lasso selection.
             if let Some((_, uv)) = paint_uv_under_cursor(doc, renderer, canvas, input.cursor) {
-                if let Some(shape) = renderer.magic_wand_select(uv, shell.magic_wand_tolerance) {
+                if let Some(shape) = renderer.magic_wand_select(uv, shell.magic_wand_tolerance, shell.magic_wand_contiguous) {
                     input.select_rect = Some(suite_gpu::selection_shape_bounds(&shape));
                     input.select_extra = Some(shape);
                 }

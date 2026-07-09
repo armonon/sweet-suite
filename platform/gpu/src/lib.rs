@@ -634,6 +634,36 @@ pub fn flood_fill_mask(pixels: &[u8], width: usize, height: usize, seed_uv: [f32
     (mask, count)
 }
 
+/// **Pure** global colour-range select: like `flood_fill_mask` but with *no* connectivity —
+/// every texel within `tolerance` of the seed's colour is selected, wherever it is (the Magic
+/// Wand's "Contiguous: off" mode / Photoshop's Select → Color Range). Used by
+/// `Renderer::magic_wand_select` when non-contiguous.
+pub fn color_range_mask(pixels: &[u8], width: usize, height: usize, seed_uv: [f32; 2], tolerance: f32) -> (Vec<u8>, usize) {
+    let px = (seed_uv[0].clamp(0.0, 0.9999) * width as f32) as usize;
+    let py = (seed_uv[1].clamp(0.0, 0.9999) * height as f32) as usize;
+    let seed_idx = (py * width + px) * 4;
+    let (sr, sg, sb, sa) = (
+        pixels[seed_idx] as f32 / 255.0,
+        pixels[seed_idx + 1] as f32 / 255.0,
+        pixels[seed_idx + 2] as f32 / 255.0,
+        pixels[seed_idx + 3] as f32 / 255.0,
+    );
+    let mut mask = vec![0u8; width * height];
+    let mut count = 0usize;
+    for i in 0..width * height {
+        let idx = i * 4;
+        let m = (pixels[idx] as f32 / 255.0 - sr).abs() <= tolerance
+            && (pixels[idx + 1] as f32 / 255.0 - sg).abs() <= tolerance
+            && (pixels[idx + 2] as f32 / 255.0 - sb).abs() <= tolerance
+            && (pixels[idx + 3] as f32 / 255.0 - sa).abs() <= tolerance;
+        if m {
+            mask[i] = 255;
+            count += 1;
+        }
+    }
+    (mask, count)
+}
+
 /// **Pure** whole-layer shift by `(dx, dy)` texels. Texels that would land off-canvas are
 /// dropped; the newly-revealed edge is transparent. Used by `Renderer::move_active_layer`
 /// (M4) when there's no active selection — Photoshop's Move tool with nothing selected
@@ -2805,10 +2835,16 @@ impl Renderer {
     /// Magic Wand used to flood-fill pixels immediately and irreversibly outside undo's
     /// per-stroke granularity; as a selection it composes with every other tool instead.
     /// Thin GPU-readback wrapper around the pure `flood_fill_mask` (see there for the BFS).
-    pub fn magic_wand_select(&mut self, seed_uv: [f32; 2], tolerance: f32) -> Option<SelectionShape> {
+    pub fn magic_wand_select(&mut self, seed_uv: [f32; 2], tolerance: f32, contiguous: bool) -> Option<SelectionShape> {
         let (width, height) = (self.raster.width() as usize, self.raster.height() as usize);
         let pixels = self.paint_readback_rgba();
-        let (mask, count) = flood_fill_mask(&pixels, width, height, seed_uv, tolerance);
+        // `contiguous` = the classic flood fill (connected region); off = a global colour
+        // range (every matching texel anywhere — "Select by Color").
+        let (mask, count) = if contiguous {
+            flood_fill_mask(&pixels, width, height, seed_uv, tolerance)
+        } else {
+            color_range_mask(&pixels, width, height, seed_uv, tolerance)
+        };
         if count == 0 {
             return None;
         }
@@ -3850,7 +3886,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, crop_pixels, feather_mask, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
+    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, color_range_mask, crop_pixels, feather_mask, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -4156,6 +4192,28 @@ mod m4_tests {
                 assert_eq!(mask[y * w + x], expect, "mismatch at ({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn color_range_selects_disconnected_regions_unlike_flood_fill() {
+        // Two separate red squares on green, with a green gap between them. Flood fill from one
+        // reaches only that square; colour range picks up BOTH (that's the whole distinction).
+        let (w, h) = (10, 4);
+        let mut buf = vec![0u8; w * h * 4];
+        for p in buf.chunks_mut(4) { p.copy_from_slice(&[0, 255, 0, 255]); } // green
+        let set = |buf: &mut [u8], x: usize, y: usize| {
+            let i = (y * w + x) * 4; buf[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+        };
+        for y in 0..h { for x in 0..2 { set(&mut buf, x, y); } }      // left red block
+        for y in 0..h { for x in 7..9 { set(&mut buf, x, y); } }      // right red block (disconnected)
+        // Seed inside the left block.
+        let (ff, ffn) = flood_fill_mask(&buf, w, h, [0.05, 0.5], 0.1);
+        let (cr, crn) = color_range_mask(&buf, w, h, [0.05, 0.5], 0.1);
+        assert_eq!(ffn, 2 * h, "flood fill reaches only the connected left block");
+        assert_eq!(crn, 2 * 2 * h, "colour range reaches both red blocks");
+        // The right block: unselected by flood fill, selected by colour range.
+        assert_eq!(ff[(h / 2) * w + 8], 0, "flood fill must not jump the gap");
+        assert_eq!(cr[(h / 2) * w + 8], 255, "colour range selects the far block");
     }
 
     #[test]

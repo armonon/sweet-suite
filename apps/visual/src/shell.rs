@@ -89,6 +89,8 @@ pub struct ShellState {
     pub sculpt_strength: f32,
     /// Magic Wand tolerance (0–1 per channel).
     pub magic_wand_tolerance: f32,
+    /// Magic Wand: contiguous (flood fill) vs global colour range ("Select by Color").
+    pub magic_wand_contiguous: bool,
     /// Tier 1: selection feather radius in canvas texels (0 = hard edge). Synced to
     /// `Renderer::selection_feather`; softens the selection's edge for Paint/Gradient/Move/Text.
     pub selection_feather: f32,
@@ -200,6 +202,7 @@ impl Default for ShellState {
             sculpt_radius: 0.5,
             sculpt_strength: 0.05,
             magic_wand_tolerance: 0.1,
+            magic_wand_contiguous: true,
             selection_feather: 0.0,
             mask_edit: false,
             pending_heightmap: false,
@@ -1064,12 +1067,14 @@ pub fn draw_shell(
                     ui.label(RichText::new("Tolerance").color(TEXT_2));
                     ui.add(egui::Slider::new(&mut state.magic_wand_tolerance, 0.0..=1.0));
                 });
+                ui.checkbox(&mut state.magic_wand_contiguous, RichText::new("Contiguous").color(TEXT_1));
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new("Click on the canvas to select the contiguous color region under the cursor (samples the flattened composite). Produces a selection, same as Ellipse/Lasso — use Paint/Gradient/Move afterward to actually affect it.")
-                        .color(TEXT_2)
-                        .small(),
-                );
+                let wand_hint = if state.magic_wand_contiguous {
+                    "Click to select the connected colour region under the cursor. Produces a selection (like Ellipse/Lasso) — use Paint/Gradient/Move afterward. Uncheck Contiguous to select that colour everywhere on the canvas (Select by Color)."
+                } else {
+                    "Select by Color: click to select every pixel of that colour across the whole canvas, connected or not. Re-check Contiguous for a single connected region."
+                };
+                ui.label(RichText::new(wand_hint).color(TEXT_2).small());
                 ui.add_space(12.0);
             }
 

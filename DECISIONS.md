@@ -1589,3 +1589,9 @@ Added the twelve standard *separable* (per-channel) modes SWEET lacked — Darke
 **Documented consistency choice:** these blend in the compositor's **linear** space (sRGB textures auto-decode on sample), matching SWEET's existing eight — so they're internally consistent but not pixel-identical to Photoshop's gamma-space blends. Re-architecting the whole compositor to gamma-space blending would change the existing modes too; not worth it for parity-of-capability. The remaining PS modes are the non-separable HSL set (Hue/Saturation/Color/Luminosity) + Darker/Lighter Color, which need whole-pixel (not per-channel) math — a separate, later add.
 
 101 workspace tests green (1 new GPU test). No warnings.
+
+---
+
+## Parity — Select by Color (Magic Wand "Contiguous" toggle) — 2026-07-07
+
+Next parity item off the matrix: the Magic Wand's global-colour-range sibling. Added a pure `color_range_mask` next to `flood_fill_mask` — same colour-tolerance test, but with **no connectivity**: every matching texel anywhere is selected. `magic_wand_select` gained a `contiguous` flag choosing between the two; a "Contiguous" checkbox in the wand inspector (on by default = the old behaviour) flips it. Off = Photoshop's Select → Color Range. Reuses the whole `SelectionShape::Mask` path, so the result composes with Paint/Gradient/Move/feather/layer-masks like any other selection. Pure fn, unit-tested (two disconnected red blocks: flood fill reaches one, colour range reaches both). 102 tests green.
