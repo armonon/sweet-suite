@@ -98,6 +98,9 @@ pub struct ShellState {
     /// instead of its colour. Synced to `Renderer::mask_edit`. Only meaningful when the active
     /// layer has a mask (the renderer falls back to colour otherwise).
     pub mask_edit: bool,
+    /// Select → Modify amount (texels) + a pending Grow/Shrink/Smooth request drained by main.rs.
+    pub selection_modify_px: f32,
+    pub pending_selection_modify: Option<suite_gpu::SelectionModify>,
     /// Set when the user clicks "→ 3D Heightmap" on a paint canvas. main.rs drains this.
     pub pending_heightmap: bool,
     /// Heightmap settings.
@@ -203,6 +206,8 @@ impl Default for ShellState {
             sculpt_strength: 0.05,
             magic_wand_tolerance: 0.1,
             magic_wand_contiguous: true,
+            selection_modify_px: 4.0,
+            pending_selection_modify: None,
             selection_feather: 0.0,
             mask_edit: false,
             pending_heightmap: false,
@@ -897,6 +902,25 @@ pub fn draw_shell(
                         .color(TEXT_2)
                         .small(),
                 );
+                ui.add_space(8.0);
+                // Select → Modify: morphological grow/shrink + smooth (parity).
+                let has_sel = state.selection_rect.is_some();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Modify").color(TEXT_2));
+                    ui.add(egui::DragValue::new(&mut state.selection_modify_px).speed(0.5).range(1.0..=200.0).suffix(" px"));
+                });
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(has_sel, egui::Button::new(RichText::new("Grow").color(TEXT_0)).small()).clicked() {
+                        state.pending_selection_modify = Some(suite_gpu::SelectionModify::Grow);
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new(RichText::new("Shrink").color(TEXT_0)).small()).clicked() {
+                        state.pending_selection_modify = Some(suite_gpu::SelectionModify::Shrink);
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new(RichText::new("Smooth").color(TEXT_0)).small()).clicked() {
+                        state.pending_selection_modify = Some(suite_gpu::SelectionModify::Smooth);
+                    }
+                });
+                ui.label(RichText::new("Grow / shrink the selection by the pixel amount, or smooth (round) its edges.").color(TEXT_2).small());
                 ui.add_space(12.0);
             }
 

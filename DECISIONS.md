@@ -1595,3 +1595,12 @@ Added the twelve standard *separable* (per-channel) modes SWEET lacked — Darke
 ## Parity — Select by Color (Magic Wand "Contiguous" toggle) — 2026-07-07
 
 Next parity item off the matrix: the Magic Wand's global-colour-range sibling. Added a pure `color_range_mask` next to `flood_fill_mask` — same colour-tolerance test, but with **no connectivity**: every matching texel anywhere is selected. `magic_wand_select` gained a `contiguous` flag choosing between the two; a "Contiguous" checkbox in the wand inspector (on by default = the old behaviour) flips it. Off = Photoshop's Select → Color Range. Reuses the whole `SelectionShape::Mask` path, so the result composes with Paint/Gradient/Move/feather/layer-masks like any other selection. Pure fn, unit-tested (two disconnected red blocks: flood fill reaches one, colour range reaches both). 102 tests green.
+
+---
+
+## Parity — Select → Modify (Grow / Shrink / Smooth) — 2026-07-07
+
+Next off the matrix. Pure morphology on the selection mask: `morph_mask` (separable, edge-clamped max-filter dilate = Grow / min-filter erode = Shrink) and `smooth_mask` (feather then re-threshold at 50% → rounded but still hard-edged, unlike feather). `Renderer::modify_selection(radius, op)` rasterizes the current selection to a raw (un-feathered) coverage mask, morphs it, and rebuilds it as a `SelectionShape::Mask` — so it composes with everything downstream. A "Modify: Grow / Shrink / Smooth" row + px amount in the selection inspector; main.rs drains the request and syncs the new selection back (mirrors the Move-commit sync). Pure fns, unit-tested (4×4 square → 6×6 grow / 2×2 shrink; smooth keeps 0/255 and rounds a lone speck away). 104 tests green.
+
+### Finding worth flagging: adjustment layers aren't wired to the display
+While scoping the adjustment cluster (Curves/Color Balance/etc.), found that `compositor::Compositor` is never instantiated in the app and `ObjectKind::Adjustment` is `continue`'d in the render loop — the adjustment data model, the `ADJUST_WGSL` shader, the CPU `apply_linear` reference, and the inspector UI all exist and are unit-tested, but nothing applies an adjustment layer to the paint canvas that's actually shown. So the whole adjustment cluster of parity (Curves, Color Balance, Gradient Map, Channel Mixer, Photo Filter, Selective Color, Shadows/Highlights, Color Lookup) is blocked on first wiring adjustment application into the display path — a real prerequisite, deferred rather than built on top of blind. Continuing with parity items that are functional end-to-end.

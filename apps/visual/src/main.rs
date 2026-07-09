@@ -1086,6 +1086,21 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Select → Modify (Grow/Shrink/Smooth) issued by the selection inspector.
+                if let Some(op) = self.shell.pending_selection_modify.take() {
+                    let radius = self.shell.selection_modify_px.round().max(0.0) as usize;
+                    if let Some(new_sel) = renderer.modify_selection(radius, op) {
+                        // Sync the morphed selection back out (renderer owns it; mirror to
+                        // shell + input so the overlay/scissor and next-frame sync agree).
+                        self.shell.selection_rect = Some(new_sel);
+                        self.input.select_rect = Some(new_sel);
+                        self.shell.selection_extra = renderer.selection_extra.clone();
+                        self.input.select_extra = renderer.selection_extra.clone();
+                        self.shell.dirty = true;
+                        window.request_redraw();
+                    }
+                }
+
                 // Apply a layer transform (M4 flip/180°) issued by an inspector button.
                 if let Some(op) = self.shell.pending_layer_transform.take() {
                     renderer.transform_active_layer(op);

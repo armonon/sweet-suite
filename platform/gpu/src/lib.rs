@@ -229,6 +229,14 @@ pub enum SelectionShape {
     Mask { width: u32, height: u32, data: Vec<u8> },
 }
 
+/// Select → Modify operations (Tier 1 parity). See `Renderer::modify_selection`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionModify {
+    Grow,
+    Shrink,
+    Smooth,
+}
+
 /// **Pure**: rasterize a `SelectionShape` into a full-canvas mask (row-major, one byte per
 /// texel: 0 = unselected, 255 = fully selected). The boundary is antialiased over roughly
 /// one texel so edges aren't jagged.
@@ -399,6 +407,55 @@ pub fn feather_mask(mask: &[u8], width: usize, height: usize, radius: usize) -> 
     }
     let once = box_blur_1ch(mask, width, height, radius);
     box_blur_1ch(&once, width, height, radius)
+}
+
+/// **Pure** separable morphology on a coverage mask with a square (2·radius+1) structuring
+/// element: `grow=true` dilates (max filter — expands the selection outward), `grow=false`
+/// erodes (min filter — shrinks it inward). Edge-clamped, O(width·height) per pass. Used by
+/// Select → Modify → Grow / Contract.
+pub fn morph_mask(mask: &[u8], width: usize, height: usize, radius: usize, grow: bool) -> Vec<u8> {
+    if radius == 0 || width == 0 || height == 0 {
+        return mask.to_vec();
+    }
+    let r = radius as isize;
+    let (w, h) = (width as isize, height as isize);
+    let pick = |a: u8, b: u8| if grow { a.max(b) } else { a.min(b) };
+    // Horizontal pass.
+    let mut tmp = vec![0u8; mask.len()];
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            let mut acc = mask[row + x];
+            for k in -r..=r {
+                let xx = (x as isize + k).clamp(0, w - 1) as usize;
+                acc = pick(acc, mask[row + xx]);
+            }
+            tmp[row + x] = acc;
+        }
+    }
+    // Vertical pass.
+    let mut dst = vec![0u8; mask.len()];
+    for x in 0..width {
+        for y in 0..height {
+            let mut acc = tmp[y * width + x];
+            for k in -r..=r {
+                let yy = (y as isize + k).clamp(0, h - 1) as usize;
+                acc = pick(acc, tmp[yy * width + x]);
+            }
+            dst[y * width + x] = acc;
+        }
+    }
+    dst
+}
+
+/// **Pure** smooth a coverage mask (rounds jagged corners) by feathering then re-thresholding
+/// at 50% — Select → Modify → Smooth. Keeps a hard edge but rounded, unlike `feather_mask`.
+pub fn smooth_mask(mask: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    if radius == 0 {
+        return mask.to_vec();
+    }
+    let blurred = feather_mask(mask, width, height, radius);
+    blurred.iter().map(|&v| if v >= 128 { 255 } else { 0 }).collect()
 }
 
 // sRGB <-> linear transfer (the paint texture is `Rgba8UnormSrgb`, so direct CPU pixel
@@ -2268,6 +2325,46 @@ impl Renderer {
         Some(mask)
     }
 
+    /// Raw (un-feathered) coverage of the current selection — the exact shape mask, or a rect
+    /// fill, or `None` for no/whole-canvas selection. Used by `modify_selection` (which does its
+    /// own morphology and shouldn't see feather baked in).
+    fn raw_selection_coverage(&self, w: usize, h: usize) -> Option<Vec<u8>> {
+        if let Some(shape) = &self.selection_extra {
+            return Some(rasterize_selection_mask(w, h, shape));
+        }
+        let [x0, y0, x1, y1] = self.selection_rect?;
+        if x1 <= x0 || y1 <= y0 || (x0 <= 0.0 && y0 <= 0.0 && x1 >= 1.0 && y1 >= 1.0) {
+            return None;
+        }
+        let (sx0, sy0) = ((x0 * w as f32) as usize, (y0 * h as f32) as usize);
+        let (sx1, sy1) = ((x1 * w as f32).ceil() as usize, (y1 * h as f32).ceil() as usize);
+        let mut mask = vec![0u8; w * h];
+        for y in sy0.min(h)..sy1.min(h) {
+            for x in sx0.min(w)..sx1.min(w) {
+                mask[y * w + x] = 255;
+            }
+        }
+        Some(mask)
+    }
+
+    /// **Select → Modify: Grow / Contract / Smooth.** Rebuilds the current selection as a
+    /// morphed `SelectionShape::Mask`. No-op with no (or a whole-canvas) selection. Returns the
+    /// new bounding rect for the app to sync back onto the overlay/scissor.
+    pub fn modify_selection(&mut self, radius_px: usize, op: SelectionModify) -> Option<[f32; 4]> {
+        let (w, h) = (self.raster.width() as usize, self.raster.height() as usize);
+        let coverage = self.raw_selection_coverage(w, h)?;
+        let modified = match op {
+            SelectionModify::Grow => morph_mask(&coverage, w, h, radius_px, true),
+            SelectionModify::Shrink => morph_mask(&coverage, w, h, radius_px, false),
+            SelectionModify::Smooth => smooth_mask(&coverage, w, h, radius_px),
+        };
+        let shape = SelectionShape::Mask { width: w as u32, height: h as u32, data: modified };
+        let bounds = selection_shape_bounds(&shape);
+        self.selection_extra = Some(shape);
+        self.selection_rect = Some(bounds);
+        Some(bounds)
+    }
+
     /// **S3: Add/replace a layer mask from the current selection.** The masked-in region stays
     /// visible; everything outside the selection is hidden (non-destructively — the layer's
     /// pixels are untouched). Reuses every selection tool + feathering via
@@ -3886,7 +3983,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, color_range_mask, crop_pixels, feather_mask, flood_fill_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, LayerTransform, SelectionShape};
+    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, color_range_mask, crop_pixels, feather_mask, flood_fill_mask, morph_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, smooth_mask, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -4285,6 +4382,37 @@ mod m4_tests {
         for x in 1..w {
             assert!(out[row + x] <= out[row + x - 1], "ramp must be monotonic at x={x}: {} then {}", out[row + x - 1], out[row + x]);
         }
+    }
+
+    #[test]
+    fn morph_grows_and_shrinks_a_square_selection() {
+        // A 4×4 filled square centered in a 12×12 mask. Grow by 1 → 6×6; shrink by 1 → 2×2.
+        let (w, h) = (12, 12);
+        let mut mask = vec![0u8; w * h];
+        for y in 4..8 { for x in 4..8 { mask[y * w + x] = 255; } }
+        let count = |m: &[u8]| m.iter().filter(|&&v| v > 0).count();
+        let grown = morph_mask(&mask, w, h, 1, true);
+        assert_eq!(count(&grown), 6 * 6, "grow by 1 turns a 4×4 into a 6×6");
+        assert_eq!(grown[3 * w + 3], 255, "a corner one step out is now selected");
+        let shrunk = morph_mask(&mask, w, h, 1, false);
+        assert_eq!(count(&shrunk), 2 * 2, "shrink by 1 turns a 4×4 into a 2×2");
+        assert_eq!(shrunk[4 * w + 4], 0, "the old edge texel is eroded away");
+        // radius 0 is an identity for both.
+        assert_eq!(morph_mask(&mask, w, h, 0, true), mask);
+    }
+
+    #[test]
+    fn smooth_rounds_but_keeps_a_hard_edge() {
+        // Smooth returns only 0/255 (a hard edge, unlike feather), and doesn't wipe a solid
+        // interior. A single lone speck gets rounded away; a solid block survives.
+        let (w, h) = (10, 10);
+        let mut mask = vec![0u8; w * h];
+        for y in 2..8 { for x in 2..8 { mask[y * w + x] = 255; } } // solid block
+        mask[0] = 255; // a lone corner speck
+        let out = smooth_mask(&mask, w, h, 2);
+        assert!(out.iter().all(|&v| v == 0 || v == 255), "smooth keeps a hard (0/255) edge");
+        assert_eq!(out[5 * w + 5], 255, "the solid interior survives smoothing");
+        assert_eq!(out[0], 0, "a lone speck is rounded away");
     }
 
     #[test]
