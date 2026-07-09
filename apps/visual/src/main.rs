@@ -55,6 +55,9 @@ struct App {
     canvas_edit_active: bool,
     /// An image file passed on the command line, imported once the renderer is ready.
     pending_startup_image: Option<std::path::PathBuf>,
+    /// A file dropped onto the window (image → import as canvas, `.sweet` → open), processed
+    /// next frame outside the renderer borrow.
+    pending_dropped_path: Option<std::path::PathBuf>,
 }
 
 /// Which undoable surface a history entry belongs to.
@@ -95,6 +98,7 @@ impl App {
             edit_pending: false,
             canvas_edit_active: false,
             pending_startup_image,
+            pending_dropped_path: None,
         }
     }
 
@@ -154,6 +158,22 @@ impl App {
         self.frame_baseline = None;
         self.edit_pending = false;
         self.canvas_edit_active = false;
+    }
+
+    /// Import decoded image pixels as the working canvas (M5: canvas takes the image's own
+    /// aspect). Shared by the "Import Image" button and drag-and-drop. A structural resize
+    /// (like opening a project), so it clears undo/redo rather than pushing an undoable step.
+    fn apply_imported_image(&mut self, w: u32, h: u32, rgba: &[u8]) {
+        if rgba.is_empty() {
+            return;
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.import_replace_canvas(w, h, rgba);
+            self.undo_order.clear();
+            self.redo_order.clear();
+        }
+        Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
+        self.shell.dirty = true;
     }
 
     /// Read the painted raster back from the GPU for embedding in a save. `None` if the
@@ -264,21 +284,7 @@ impl App {
             FileAction::ImportImage => {
                 if self.renderer.is_some() {
                     if let Some(((w, h), rgba, status)) = persistence::import_image_dialog(MAX_IMPORT_DIM) {
-                        if !rgba.is_empty() {
-                            if let Some(r) = self.renderer.as_mut() {
-                                // M5: the canvas takes the image's own aspect ratio. This is a
-                                // structural resize (like opening a project), not a single
-                                // undoable stroke — it replaces the whole paint substrate, so
-                                // there's no prior-canvas-of-this-size to revert to. Clear the
-                                // undo/redo queues too so a later ⌘Z doesn't hit a stale
-                                // now-inert Paint entry from before the resize.
-                                r.import_replace_canvas(w, h, &rgba);
-                                self.undo_order.clear();
-                                self.redo_order.clear();
-                            }
-                            Self::rescale_paint_canvases_to_aspect(&mut self.document, w, h);
-                            self.shell.dirty = true;
-                        }
+                        self.apply_imported_image(w, h, &rgba);
                         self.shell.status = status;
                     }
                 }
@@ -397,6 +403,44 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
         }
+        // Drain a drag-and-dropped file: an image imports as the working canvas; a `.sweet`
+        // opens as a project. Runs here (full &mut self, no renderer borrow held).
+        if let Some(path) = self.pending_dropped_path.take() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext == "sweet" {
+                match persistence::load_from(&path) {
+                    Ok(loaded) => {
+                        self.document = loaded.document;
+                        self.reset_undo_state();
+                        if !loaded.layers.is_empty() {
+                            if let Some(r) = self.renderer.as_mut() {
+                                let layers: Vec<suite_gpu::LoadedLayer> = loaded.layers.into_iter().map(|l| suite_gpu::LoadedLayer {
+                                    rgba: l.rgba, width: l.width, height: l.height, name: l.name,
+                                    visible: l.visible, opacity: l.opacity, blend: l.blend, mask: l.mask,
+                                }).collect();
+                                r.replace_layers(layers);
+                            }
+                        }
+                        self.shell.current_path = Some(path.clone());
+                        self.shell.dirty = false;
+                        self.shell.status = format!("Opened {}", path.display());
+                    }
+                    Err(e) => self.shell.status = format!("Open failed: {e}"),
+                }
+            } else if self.renderer.is_some() {
+                match persistence::import_image_from(&path, MAX_IMPORT_DIM) {
+                    Ok((w, h, rgba)) => {
+                        self.apply_imported_image(w, h, &rgba);
+                        self.shell.tool = tools::Tool::Paint;
+                        self.shell.status = format!("Imported {}", path.display());
+                    }
+                    Err(e) => self.shell.status = format!("Couldn't open {}: {e}", path.display()),
+                }
+            }
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
+        }
         // Drain a clear-canvas request (the brush panel button).
         if self.shell.clear_canvas_requested {
             self.shell.clear_canvas_requested = false;
@@ -499,6 +543,12 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => renderer.resize(size.width, size.height),
+            // Drag-and-drop: stash the path; it's processed next frame outside this renderer
+            // borrow (image → import as canvas, `.sweet` → open as a project).
+            WindowEvent::DroppedFile(path) => {
+                self.pending_dropped_path = Some(path);
+                window.request_redraw();
+            }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m,
             WindowEvent::CursorMoved { position, .. } => {
                 self.input.cursor = (position.x as f32, position.y as f32);

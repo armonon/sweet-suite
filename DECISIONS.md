@@ -1604,3 +1604,9 @@ Next off the matrix. Pure morphology on the selection mask: `morph_mask` (separa
 
 ### Finding worth flagging: adjustment layers aren't wired to the display
 While scoping the adjustment cluster (Curves/Color Balance/etc.), found that `compositor::Compositor` is never instantiated in the app and `ObjectKind::Adjustment` is `continue`'d in the render loop — the adjustment data model, the `ADJUST_WGSL` shader, the CPU `apply_linear` reference, and the inspector UI all exist and are unit-tested, but nothing applies an adjustment layer to the paint canvas that's actually shown. So the whole adjustment cluster of parity (Curves, Color Balance, Gradient Map, Channel Mixer, Photo Filter, Selective Color, Shadows/Highlights, Color Lookup) is blocked on first wiring adjustment application into the display path — a real prerequisite, deferred rather than built on top of blind. Continuing with parity items that are functional end-to-end.
+
+---
+
+## Usability — drag-and-drop image / project import — 2026-07-07
+
+Armon asked, directly, whether he can drag images in and work on them — and drag-and-drop wasn't wired (only the Import Image button + CLI arg were). Added `WindowEvent::DroppedFile`: an image file dropped on the window imports as the working canvas (reusing the exact, already-proven `import_image_from` → `import_replace_canvas` path the button uses); a `.sweet` file opens as a project. The drop handler can't touch `&mut self` methods while the renderer borrow is live, so it stashes the path in `pending_dropped_path` and processes it next frame next to the other pending-file drains (same pattern as the existing CLI `pending_startup_image`). Extracted the button's import body into a shared `apply_imported_image` so both paths are one implementation. No new test — it's thin glue over the tested import path. Documented in QUICKSTART. (Drop = replace-canvas, matching Import Image; drop-as-new-layer is a follow-up.)
