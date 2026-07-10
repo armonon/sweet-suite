@@ -1704,3 +1704,15 @@ Armon: "then lets upgrade our UI." The clear eyesore was the left tool strip: a 
 Screenshot-verified live (Screen Recording available this session) — the palette renders crisply with all sections/labels fitting their buttons and nothing cut off, the active tool highlights, and the top-bar brand + dividers read cleanly. Pure egui layout/styling in `apps/visual/src/shell.rs` — no logic change to any tool, no test surface touched; full workspace still builds clean, 108 tests green.
 
 Next UI candidates (not blocking): inspector density/typography pass, a real app icon, and eventually swapping the text tool labels for glyph icons once a bundled icon font is in place.
+
+---
+
+## UI upgrade — app icon — 2026-07-09
+
+Continuing "upgrade our UI": the bundle shipped with no icon (generic app tile in Finder/Dock). Added a real one.
+
+- `scripts/make_icon.py` (pure PIL + macOS `iconutil`) generates a modern rounded-square ("squircle") icon: a brand-blue vertical gradient (the app's ACCENT ramp), a soft top-left highlight, a thin glass edge, and a bold white "S" brand mark with a subtle drop shadow. It rasterizes the full macOS iconset (16→1024, incl. @2x) and packs `assets/AppIcon.icns`.
+- `package_macos.sh` copies the `.icns` into `Contents/Resources` and Info.plist gains `CFBundleIconFile`. The `.icns` is committed (reproducible bundles without needing PIL on every build machine); the generator is kept so the design can be tweaked and re-run.
+- **Verified live:** Finder shows the blue-"S" icon next to SweetVisual (not the generic tile). (Dock display can lag behind macOS's icon cache, but the bundle is correct.)
+
+Together with the grouped tool palette + top-bar polish, the app now reads as a real, branded product rather than a dev harness. Remaining UI candidates (deferred, not blocking): an inspector density/typography pass, and glyph icons on the tool buttons (needs a bundled icon font — the readable text labels are already a big step up, so this is low priority).
