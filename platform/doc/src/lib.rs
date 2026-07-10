@@ -160,7 +160,7 @@ impl BlendMode {
 /// Adjustment-layer kinds. The first three are the originals; the rest are the photo-
 /// editing set (algorithm reference: PhotoDemon, BSD-licensed — `tannerhelland/PhotoDemon`),
 /// reimplemented per-pixel in linear HDR space. All are non-destructive layers.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AdjustmentKind {
     BrightnessContrast { brightness: f32, contrast: f32 },
     HueSaturation { hue: f32, saturation: f32, lightness: f32 },

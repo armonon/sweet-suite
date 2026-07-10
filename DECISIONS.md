@@ -1610,3 +1610,22 @@ While scoping the adjustment cluster (Curves/Color Balance/etc.), found that `co
 ## Usability — drag-and-drop image / project import — 2026-07-07
 
 Armon asked, directly, whether he can drag images in and work on them — and drag-and-drop wasn't wired (only the Import Image button + CLI arg were). Added `WindowEvent::DroppedFile`: an image file dropped on the window imports as the working canvas (reusing the exact, already-proven `import_image_from` → `import_replace_canvas` path the button uses); a `.sweet` file opens as a project. The drop handler can't touch `&mut self` methods while the renderer borrow is live, so it stashes the path in `pending_dropped_path` and processes it next frame next to the other pending-file drains (same pattern as the existing CLI `pending_startup_image`). Extracted the button's import body into a shared `apply_imported_image` so both paths are one implementation. No new test — it's thin glue over the tested import path. Documented in QUICKSTART. (Drop = replace-canvas, matching Import Image; drop-as-new-layer is a follow-up.)
+
+---
+
+## Parity — adjustment layers now affect the live canvas (+ export) — 2026-07-07
+
+Long-standing gap closed. Adjustment layers (Brightness/Contrast, Levels, Hue/Sat, Exposure, Vibrance, White-Balance, Posterize, Threshold, Invert, Box/Gaussian Blur, Sharpen, Edge-Detect) existed as document objects with full inspector UI and a **tested, shipping shader** (`ADJUST_WGSL`) in the reusable `Compositor` — but the app's *live* display flattens layers through the Renderer's own inline `record_composite`, which never ran the adjustment passes. So adding an adjustment layer changed the doc and the inspector but **did nothing visible**. Now it actually adjusts the on-screen (and exported) image.
+
+### What shipped
+- `Renderer::record_flatten_and_adjust`: after the normal layer flatten, it runs each active adjustment as a full-screen `ADJUST_WGSL` pass, ping-ponging `self.raster` ↔ `comp_a` (odd pass count → one copy back to the display cache). `composite_layers` and `paint_readback_rgba` (save/Export PNG) both route through it, so what you see and what you export match.
+- `render()` collects the document's visible `Adjustment` objects (in stack order) into `active_adjustments` each frame and re-flattens when that set changes — add / remove / re-parametrize / toggle-visibility all update the canvas live.
+- **No shader duplication:** the per-kind pass list was extracted from the `Compositor`'s inline `match` into a shared `pub(crate) adjustment_passes(kind)`, now called by both the reusable `Compositor` and the Renderer's live path; `ADJUST_WGSL` was made `pub(crate)` so the one shader string drives both. `AdjustmentKind` gained `PartialEq` so the per-frame change-detection is a cheap `!=`.
+
+### Verified on real hardware
+Added a headless-GPU test that runs the exact `ADJUST_WGSL` with the Invert mode and the **same 32-byte `AdjParams` packing** `record_flatten_and_adjust` writes: red in → cyan out. This covers the concrete new integration risk — a wrong param byte-offset or a broken shader branch would fail the test rather than silently corrupt the composite. (The ping-pong copy-back logic is Renderer-internal and still wants an eventual eyes-on pass, but the shader-execution + param-encoding — the parts that were genuinely new to this path — are GPU-verified.) 104 workspace tests green.
+
+### Colour space
+`self.raster`/`comp_a` are `Rgba8UnormSrgb`, so the adjust shader samples sRGB→linear and writes linear→sRGB automatically — i.e. the adjustment math runs in linear space, identical to how it runs in the `Compositor`'s `Rgba16Float` path. The only difference is 8-bit vs 16-bit precision (and HDR headroom for >1.0 exposure), the same tradeoff the inline layer composite already makes vs. the reference `Compositor`.
+
+Next: the eyes-on confirmation of adjustments on the live canvas once Screen Recording is stable; otherwise this closes the "adjustments do nothing on screen" gap that made them feel broken.

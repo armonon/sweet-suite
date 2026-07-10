@@ -55,6 +55,38 @@ const ADJ_SHARPEN: u32 = 10;
 const ADJ_EDGE_DETECT: u32 = 11;
 const ADJ_GAUSSIAN: u32 = 12;
 
+/// Map an adjustment kind to the `(mode, p0, p1, p2)` passes the `ADJUST_WGSL` shader runs.
+/// Most kinds are one pass; separable Gaussian is two (H then V, with p1/p2 carrying the
+/// direction). Shared by the reusable `Compositor` and the Renderer's live display path.
+pub(crate) fn adjustment_passes(kind: &AdjustmentKind) -> Vec<(u32, f32, f32, f32)> {
+    match kind {
+        AdjustmentKind::BrightnessContrast { brightness, contrast } => {
+            vec![(ADJ_BRIGHTNESS_CONTRAST, *brightness, *contrast, 0.0)]
+        }
+        AdjustmentKind::HueSaturation { hue, saturation, lightness } => {
+            vec![(ADJ_HUE_SATURATION, *hue, *saturation, *lightness)]
+        }
+        AdjustmentKind::Levels { black_point, gamma, white_point } => {
+            vec![(ADJ_LEVELS, *black_point, *gamma, *white_point)]
+        }
+        AdjustmentKind::Exposure { stops } => vec![(ADJ_EXPOSURE, *stops, 0.0, 0.0)],
+        AdjustmentKind::Vibrance { amount } => vec![(ADJ_VIBRANCE, *amount, 0.0, 0.0)],
+        AdjustmentKind::WhiteBalance { temperature, tint } => {
+            vec![(ADJ_WHITE_BALANCE, *temperature, *tint, 0.0)]
+        }
+        AdjustmentKind::Posterize { levels } => vec![(ADJ_POSTERIZE, *levels, 0.0, 0.0)],
+        AdjustmentKind::Threshold { level } => vec![(ADJ_THRESHOLD, *level, 0.0, 0.0)],
+        AdjustmentKind::Invert => vec![(ADJ_INVERT, 0.0, 0.0, 0.0)],
+        AdjustmentKind::BoxBlur { radius } => vec![(ADJ_BOX_BLUR, *radius, 0.0, 0.0)],
+        AdjustmentKind::Sharpen { amount } => vec![(ADJ_SHARPEN, *amount, 0.0, 0.0)],
+        AdjustmentKind::EdgeDetect => vec![(ADJ_EDGE_DETECT, 0.0, 0.0, 0.0)],
+        AdjustmentKind::GaussianBlur { radius } => vec![
+            (ADJ_GAUSSIAN, *radius, 1.0, 0.0),
+            (ADJ_GAUSSIAN, *radius, 0.0, 1.0),
+        ],
+    }
+}
+
 // ------ WGSL shaders ---------------------------------------------------------
 
 const BLEND_WGSL: &str = r#"
@@ -134,7 +166,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-const ADJUST_WGSL: &str = r#"
+pub(crate) const ADJUST_WGSL: &str = r#"
 struct VertexOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 
 @vertex
@@ -674,35 +706,7 @@ impl Compositor {
                 }
 
                 CompEntry::Adjustment(adj) => {
-                    // Most kinds are one pass; separable Gaussian is two (horizontal then
-                    // vertical), so build a list of (mode, p0, p1, p2) passes. For Gaussian,
-                    // p1/p2 carry the sampling direction (1,0) then (0,1).
-                    let passes: Vec<(u32, f32, f32, f32)> = match &adj.kind {
-                        AdjustmentKind::BrightnessContrast { brightness, contrast } => {
-                            vec![(ADJ_BRIGHTNESS_CONTRAST, *brightness, *contrast, 0.0)]
-                        }
-                        AdjustmentKind::HueSaturation { hue, saturation, lightness } => {
-                            vec![(ADJ_HUE_SATURATION, *hue, *saturation, *lightness)]
-                        }
-                        AdjustmentKind::Levels { black_point, gamma, white_point } => {
-                            vec![(ADJ_LEVELS, *black_point, *gamma, *white_point)]
-                        }
-                        AdjustmentKind::Exposure { stops } => vec![(ADJ_EXPOSURE, *stops, 0.0, 0.0)],
-                        AdjustmentKind::Vibrance { amount } => vec![(ADJ_VIBRANCE, *amount, 0.0, 0.0)],
-                        AdjustmentKind::WhiteBalance { temperature, tint } => {
-                            vec![(ADJ_WHITE_BALANCE, *temperature, *tint, 0.0)]
-                        }
-                        AdjustmentKind::Posterize { levels } => vec![(ADJ_POSTERIZE, *levels, 0.0, 0.0)],
-                        AdjustmentKind::Threshold { level } => vec![(ADJ_THRESHOLD, *level, 0.0, 0.0)],
-                        AdjustmentKind::Invert => vec![(ADJ_INVERT, 0.0, 0.0, 0.0)],
-                        AdjustmentKind::BoxBlur { radius } => vec![(ADJ_BOX_BLUR, *radius, 0.0, 0.0)],
-                        AdjustmentKind::Sharpen { amount } => vec![(ADJ_SHARPEN, *amount, 0.0, 0.0)],
-                        AdjustmentKind::EdgeDetect => vec![(ADJ_EDGE_DETECT, 0.0, 0.0, 0.0)],
-                        AdjustmentKind::GaussianBlur { radius } => vec![
-                            (ADJ_GAUSSIAN, *radius, 1.0, 0.0),
-                            (ADJ_GAUSSIAN, *radius, 0.0, 1.0),
-                        ],
-                    };
+                    let passes = adjustment_passes(&adj.kind);
 
                     let texel_w = 1.0 / self.width.max(1) as f32;
                     let texel_h = 1.0 / self.height.max(1) as f32;

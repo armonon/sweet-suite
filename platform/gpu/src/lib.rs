@@ -1230,6 +1230,13 @@ pub struct Renderer {
     /// opacity, ping-ponging between `comp_a`/`comp_b`. docs/03 §1.7.
     layer_composite_pipeline: wgpu::RenderPipeline,
     layer_composite_layout: wgpu::BindGroupLayout,
+    /// Adjustment layers: a full-screen colour/convolution pass (compositor's `ADJUST_WGSL`)
+    /// applied to the flattened composite so the document's adjustment layers actually show.
+    adjust_pipeline: wgpu::RenderPipeline,
+    adjust_layout: wgpu::BindGroupLayout,
+    /// The document's currently-active (visible) adjustment kinds, refreshed each `render`;
+    /// used to re-flatten when they change and to keep save/export WYSIWYG with the display.
+    active_adjustments: Vec<suite_doc::AdjustmentKind>,
     /// S3: a 1×1 opaque-white texture bound as the mask for layers that have none, so the
     /// composite shader's `* m` is `* 1.0` — i.e. the no-mask path is identical to pre-S3.
     _mask_white_tex: wgpu::Texture,
@@ -1629,6 +1636,78 @@ impl Renderer {
                 cache: None,
             });
 
+        // Adjustment-layer pass: samples a texture (binding 0), a sampler (1), and an
+        // AdjParams uniform (2), applying one colour/convolution transform (compositor's
+        // ADJUST_WGSL). Renders full-screen into the ping-pong scratch, in linear space.
+        let adjust_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("adjust layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let adjust_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("adjust shader"),
+            source: wgpu::ShaderSource::Wgsl(compositor::ADJUST_WGSL.into()),
+        });
+        let adjust_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("adjust pl"),
+            bind_group_layouts: &[Some(&adjust_layout)],
+            immediate_size: 0,
+        });
+        let adjust_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("adjust pipeline"),
+            layout: Some(&adjust_pl),
+            vertex: wgpu::VertexState {
+                module: &adjust_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &adjust_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let cube_mesh = build_mesh(&device, &cube_vertices());
         let sphere_mesh = build_mesh(&device, &uv_sphere_vertices(24, 16));
         let plane_mesh = build_mesh(&device, &plane_vertices());
@@ -1797,6 +1876,9 @@ impl Renderer {
             active_layer: 0,
             layers_dirty: true,
             layer_composite_pipeline,
+            adjust_pipeline,
+            adjust_layout,
+            active_adjustments: Vec::new(),
             _mask_white_tex: mask_white_tex,
             mask_white_view,
             layer_composite_layout,
@@ -2121,9 +2203,10 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("paint readback enc"),
             });
-        // Flatten the layer stack into the display cache first, so the readback (used by
-        // save + Export PNG) captures the *visible composite*, not a stale cache.
-        self.record_composite(&mut enc);
+        // Flatten the layer stack (+ adjustment layers) into the display cache first, so the
+        // readback (used by save + Export PNG) captures the *visible composite*, not a stale
+        // cache — and includes adjustments, matching what's on screen.
+        self.record_flatten_and_adjust(&mut enc);
         enc.copy_texture_to_buffer(
             self.raster.texture().as_image_copy(),
             wgpu::TexelCopyBufferInfo {
@@ -2282,14 +2365,92 @@ impl Renderer {
         );
     }
 
-    /// Recomposite the layer stack into the display cache (own encoder + submit).
+    /// Recomposite the layer stack (+ document adjustment layers) into the display cache
+    /// (own encoder + submit).
     fn composite_layers(&mut self) {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("composite enc") });
-        self.record_composite(&mut enc);
+        self.record_flatten_and_adjust(&mut enc);
         self.queue.submit(Some(enc.finish()));
         self.layers_dirty = false;
+    }
+
+    /// `record_composite`, then the document's active adjustment layers applied as full-screen
+    /// colour/convolution passes (compositor's `ADJUST_WGSL` + `adjustment_passes`), so
+    /// adjustment layers actually affect the displayed + exported image — ping-ponging
+    /// `self.raster` ↔ `comp_a`. A no-op beyond the plain composite when there are none.
+    fn record_flatten_and_adjust(&self, enc: &mut wgpu::CommandEncoder) {
+        self.record_composite(enc);
+
+        let mut passes: Vec<(u32, f32, f32, f32)> = Vec::new();
+        for k in &self.active_adjustments {
+            passes.extend(compositor::adjustment_passes(k));
+        }
+        if passes.is_empty() {
+            return;
+        }
+        let (w, h) = (self.raster.width(), self.raster.height());
+        let (tw, th) = (1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32);
+
+        // Build every param buffer + bind group up front. Even passes read the raster & write
+        // comp_a; odd passes read comp_a & write the raster (a straight ping-pong).
+        let mut binds = Vec::with_capacity(passes.len());
+        for (i, (mode, p0, p1, p2)) in passes.iter().enumerate() {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("adj param"),
+                size: 32,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            // 32-byte AdjParams: mode, p0, p1, p2, texel.xy, pad.xy — same layout the
+            // Compositor uses.
+            let bytes: [u8; 32] = bytemuck::cast([
+                *mode, p0.to_bits(), p1.to_bits(), p2.to_bits(),
+                tw.to_bits(), th.to_bits(), 0u32, 0u32,
+            ]);
+            self.queue.write_buffer(&buf, 0, &bytes);
+            let src_view = if i % 2 == 0 { self.raster.texture_view() } else { &self.comp_a_view };
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("adj bg"),
+                layout: &self.adjust_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
+                    wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
+                ],
+            });
+            binds.push(bg);
+        }
+
+        for i in 0..passes.len() {
+            let dst_view = if i % 2 == 0 { &self.comp_a_view } else { self.raster.texture_view() };
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("adj pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.adjust_pipeline);
+            rp.set_bind_group(0, &binds[i], &[]);
+            rp.draw(0..4, 0..1);
+        }
+
+        // Odd pass count → the final image sits in comp_a; copy it back to the display cache.
+        if passes.len() % 2 == 1 {
+            enc.copy_texture_to_texture(
+                self.comp_a.as_image_copy(),
+                self.raster.texture().as_image_copy(),
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
     }
 
     /// Metadata snapshot for the Layers panel (index 0 = bottom).
@@ -3064,7 +3225,19 @@ impl Renderer {
             ),
         >,
     ) -> RenderResult {
-        // Flatten the 2D layer stack into the display cache before drawing, if it changed.
+        // Adjustment layers (document `Adjustment` objects, in stack order) drive full-screen
+        // colour passes over the composite. Refresh the active set each frame; if it changed
+        // (added/removed/re-parametrized/toggled), re-flatten so the display updates live.
+        let adjustments: Vec<suite_doc::AdjustmentKind> = doc
+            .objects()
+            .filter(|o| o.kind == ObjectKind::Adjustment && o.visibility)
+            .filter_map(|o| o.adjustment.clone())
+            .collect();
+        if adjustments != self.active_adjustments {
+            self.active_adjustments = adjustments;
+            self.layers_dirty = true;
+        }
+        // Flatten the 2D layer stack (+ adjustments) into the display cache before drawing.
         if self.layers_dirty {
             self.composite_layers();
         }
@@ -4715,5 +4888,75 @@ mod layer_mask_gpu_tests {
         // Exclusion = b+s-2bs; with b=[0,1,0], s=[1,0,0] → [1,1,0] = yellow.
         let row = composite_row_mode(&white, 14).unwrap();
         assert!(near(row[0], [255, 255, 0, 255]), "Exclusion(green,red) should be yellow, got {:?}", row[0]);
+    }
+
+    /// Verify the adjustment-layer path: runs the exact `ADJUST_WGSL` the live display now uses,
+    /// with the Invert mode (8) and the same 32-byte `AdjParams` packing `record_flatten_and_adjust`
+    /// writes, on a real device — so a wrong param byte-offset or a broken shader branch would
+    /// fail here rather than silently corrupt the on-screen composite.
+    #[test]
+    fn invert_adjustment_flips_colors_on_the_gpu() {
+        const W: u32 = 2;
+        let Some((device, queue)) = headless() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(super::compositor::ADJUST_WGSL.into()) });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Red input → invert → cyan.
+        let input = tex_rgba8(&device, &queue, W, 1, &[255, 0, 0, 255].repeat(W as usize));
+        let target = tex_rgba8(&device, &queue, W, 1, &[0u8; (4 * W) as usize]);
+        let iv = input.create_view(&Default::default());
+        let tv = target.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        // ADJ_INVERT = 8; p0/p1/p2 unused; texel + pad zero. Same 32-byte layout as the app.
+        let params: [u8; 32] = bytemuck::cast([8u32, 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0u32, 0u32]);
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&ubuf, 0, &params);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&iv) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+        ] });
+
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &tv, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, ..Default::default() });
+            rp.set_pipeline(&pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..4, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(target.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } }, wgpu::Extent3d { width: W, height: 1, depth_or_array_layers: 1 });
+        queue.submit(Some(enc.finish()));
+        let slice = rb.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        let px = [data[0], data[1], data[2], data[3]];
+        assert!(near(px, [0, 255, 255, 255]), "Invert of red should be cyan, got {px:?}");
     }
 }
