@@ -1650,3 +1650,24 @@ The math lives once as `AdjustmentKind::tone_curve` (CPU) and is mirrored by `cu
 - 105 workspace tests green (2 new), no warnings. Live drag-the-curve verification pending the packaged build (Screen Recording is working again this session).
 
 Next: arbitrary-point curves (LUT), per-channel R/G/B curves, and the bigger untouched Photoshop families (pen/vector paths is the largest remaining gap).
+
+---
+
+## Parity — Gradient Map adjustment + colour-LUT infra — 2026-07-09
+
+Armon: "all" (keep pushing parity). Picked Gradient Map — a marquee grading/duotone adjustment — because it needs an arbitrary colour LUT, so building it lays down reusable **LUT infrastructure** on the adjustment pipeline (the same one I'd wired to the live canvas + GPU-verified). Fully GPU-testable, and it touches no brush pipeline — the right kind of increment while interactive tools can't be verified live.
+
+### What shipped
+`AdjustmentKind::GradientMap { lo, hi }` remaps each pixel's luminance to a colour along the `lo`→`hi` gradient (dark tones → `lo`, bright → `hi`). The inspector has two colour pickers + a live gradient-strip preview. It flows through `record_flatten_and_adjust`, so it grades the canvas live.
+
+- **LUT plumbing (the reusable part):** the gradient is baked on the CPU into a 256-entry RGBA8 LUT (`gradient_lut` / `adjustment_lut_bytes`) and bound to the adjust pipeline at a new `@binding(3)` texture. The shader's Gradient Map case (`mode 14`) samples it by luminance. Adjustments that don't use a LUT bind a **256×1 identity fallback** (never sampled — only the Gradient Map branch samples the LUT) so the binding is always satisfied without special-casing.
+- Wired symmetrically into **both** the app's inline `record_flatten_and_adjust` and the reusable `Compositor` (test-only, but kept correct — it builds the real LUT too), plus the shared `ADJUST_WGSL`. `record_flatten_and_adjust` now pairs each pass with its kind's LUT bytes so a 2-pass kind (Gaussian) shares one LUT and everything else binds the fallback.
+- The colour math lives once (`GradientMap`'s CPU `apply_linear` + `gradient_lut`) and the GPU samples the baked LUT, in linear light — consistent with every other adjustment here.
+
+### Verified on real hardware
+Refactored the ad-hoc Invert test into a reusable `run_adjust(mode, params, input, lut)` helper (now every adjustment mode is GPU-testable in one line) and added a Gradient Map test: through a black→red LUT, a white pixel comes back **red** and a black pixel **≈black** — proving the luminance→LUT sampling and the new binding-3 plumbing on real hardware. Plus CPU tests (black→lo, white→hi, 256-entry LUT ends match, non-gradient kinds have no LUT). 107 workspace tests green, no warnings.
+
+### Note
+The reusable `Compositor` is test-only (the app composites via the inline path), but I updated its adjust bind layout + `composite()` to bind the LUT (real or fallback) too, so it stays correct and its tests keep passing rather than leaving a latent "Gradient Map silently no-ops here" trap.
+
+The LUT infra now makes arbitrary-point Curves and duotone/Selective-Color cheap follow-ups. Next parity targets remain the read-modify-write brush tools (Clone Stamp, Dodge/Burn) and the big one, vector/Pen paths.

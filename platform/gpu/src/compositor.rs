@@ -55,6 +55,23 @@ const ADJ_SHARPEN: u32 = 10;
 const ADJ_EDGE_DETECT: u32 = 11;
 const ADJ_GAUSSIAN: u32 = 12;
 const ADJ_CURVES: u32 = 13;
+const ADJ_GRADIENT_MAP: u32 = 14;
+
+/// Bake an adjustment's colour LUT (if any) into 256×1 RGBA8 bytes (linear), for uploading
+/// as the `ADJUST_WGSL` LUT texture. `None` for kinds that don't use a LUT (they bind an
+/// identity fallback). Currently only `GradientMap`.
+pub(crate) fn adjustment_lut_bytes(kind: &AdjustmentKind) -> Option<Vec<u8>> {
+    kind.gradient_lut().map(|lut| {
+        let mut bytes = Vec::with_capacity(256 * 4);
+        for c in lut {
+            bytes.push((c[0].clamp(0.0, 1.0) * 255.0).round() as u8);
+            bytes.push((c[1].clamp(0.0, 1.0) * 255.0).round() as u8);
+            bytes.push((c[2].clamp(0.0, 1.0) * 255.0).round() as u8);
+            bytes.push(255);
+        }
+        bytes
+    })
+}
 
 /// Map an adjustment kind to the `(mode, p0, p1, p2)` passes the `ADJUST_WGSL` shader runs.
 /// Most kinds are one pass; separable Gaussian is two (H then V, with p1/p2 carrying the
@@ -86,6 +103,8 @@ pub(crate) fn adjustment_passes(kind: &AdjustmentKind) -> Vec<(u32, f32, f32, f3
             (ADJ_GAUSSIAN, *radius, 0.0, 1.0),
         ],
         AdjustmentKind::Curves { shadow, mid, high } => vec![(ADJ_CURVES, *shadow, *mid, *high)],
+        // The gradient is carried by the LUT texture, not scalar params.
+        AdjustmentKind::GradientMap { .. } => vec![(ADJ_GRADIENT_MAP, 0.0, 0.0, 0.0)],
     }
 }
 
@@ -186,6 +205,8 @@ fn vs(@builtin(vertex_index) vi: u32) -> VertexOutput {
 // `texel` is 1/size in UV space, for neighbor-sampling (convolution) kinds.
 struct AdjParams { mode: u32, p0: f32, p1: f32, p2: f32, texel: vec2<f32>, _pad: vec2<f32> }
 @group(0) @binding(2) var<uniform> params: AdjParams;
+// A 256×1 colour LUT (Gradient Map). Kinds that don't use it bind an identity fallback.
+@group(0) @binding(3) var lut_tex: texture_2d<f32>;
 
 // RGB ↔ HSL conversion in linear space.
 fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
@@ -362,6 +383,11 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
                 c.a,
             );
         }
+        // Gradient Map — remap luminance through the LUT (256×1). Sample at v=0.5.
+        case 14u {
+            let luma = clamp(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+            c = vec4(textureSample(lut_tex, samp, vec2(luma, 0.5)).rgb, c.a);
+        }
         default {}
     }
     return c;
@@ -398,11 +424,49 @@ pub struct Compositor {
 
     sampler: wgpu::Sampler,
 
+    /// A 256×1 black→white identity LUT bound at binding 3 for adjustments that don't use a
+    /// colour LUT (only Gradient Map does).
+    _lut_identity: wgpu::Texture,
+    lut_identity_view: wgpu::TextureView,
+
     // Ping-pong between two HDR textures for adjustment passes.
     hdr_a: wgpu::Texture,
     hdr_a_view: wgpu::TextureView,
     hdr_b: wgpu::Texture,
     hdr_b_view: wgpu::TextureView,
+}
+
+/// Build a 256×1 RGBA8 LUT texture from `bytes` (1024 bytes) and return it with its view.
+pub(crate) fn make_lut_texture(device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> (wgpu::Texture, wgpu::TextureView) {
+    let t = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("adjustment lut"),
+        size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        t.as_image_copy(),
+        bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256 * 4), rows_per_image: Some(1) },
+        wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+    );
+    let v = t.create_view(&Default::default());
+    (t, v)
+}
+
+/// The 256×1 identity ramp (black→white) LUT bytes — a harmless passthrough for adjustments
+/// that bind the LUT slot but never sample it.
+fn identity_lut_bytes() -> Vec<u8> {
+    let mut b = Vec::with_capacity(256 * 4);
+    for i in 0..256u32 {
+        let v = i as u8;
+        b.extend_from_slice(&[v, v, v, 255]);
+    }
+    b
 }
 
 /// Describes one item in the compositor pass list.
@@ -525,6 +589,17 @@ impl Compositor {
                         },
                         count: None,
                     },
+                    // The Gradient Map colour LUT (or the identity fallback).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
         let adjust_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -594,6 +669,21 @@ impl Compositor {
         let hdr_b = make_hdr("comp hdr_b");
         let hdr_b_view = hdr_b.create_view(&Default::default());
 
+        // The LUT fallback (bound when a pass has no colour LUT). Never sampled — only the
+        // Gradient Map case samples the LUT, and that always binds a real one — so it needs
+        // no upload (and there's no queue here anyway).
+        let lut_identity = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("comp lut identity"),
+            size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let lut_identity_view = lut_identity.create_view(&Default::default());
+
         Self {
             width,
             height,
@@ -603,6 +693,8 @@ impl Compositor {
             adjust_pipeline,
             adjust_bind_layout,
             sampler,
+            _lut_identity: lut_identity,
+            lut_identity_view,
             hdr_a,
             hdr_a_view,
             hdr_b,
@@ -728,6 +820,9 @@ impl Compositor {
 
                 CompEntry::Adjustment(adj) => {
                     let passes = adjustment_passes(&adj.kind);
+                    // Build the colour LUT once for this adjustment (Gradient Map); otherwise
+                    // bind the never-sampled identity fallback.
+                    let lut = adjustment_lut_bytes(&adj.kind).map(|b| make_lut_texture(device, queue, &b));
 
                     let texel_w = 1.0 / self.width.max(1) as f32;
                     let texel_h = 1.0 / self.height.max(1) as f32;
@@ -745,6 +840,7 @@ impl Compositor {
                         ]);
                         queue.write_buffer(&param_buf, 0, &bytes);
 
+                        let lut_view = lut.as_ref().map(|(_, v)| v).unwrap_or(&self.lut_identity_view);
                         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                             label: Some("comp adj bg"),
                             layout: &self.adjust_bind_layout,
@@ -752,6 +848,7 @@ impl Compositor {
                                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(current_view!()) },
                                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                                 wgpu::BindGroupEntry { binding: 2, resource: param_buf.as_entire_binding() },
+                                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lut_view) },
                             ],
                         });
 

@@ -1350,6 +1350,27 @@ pub fn draw_shell(
                                     }
                                 }
                             }
+                            suite_doc::AdjustmentKind::GradientMap { lo, hi } => {
+                                ui.label(RichText::new("Remaps brightness across two colours (dark tones → shadow colour, bright → highlight).").color(TEXT_2).small());
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Shadows").color(TEXT_2));
+                                    changed |= ui.color_edit_button_rgb(lo).changed();
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new("Highlights").color(TEXT_2));
+                                    changed |= ui.color_edit_button_rgb(hi).changed();
+                                });
+                                // Gradient preview strip.
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(184.0, 14.0), egui::Sense::hover());
+                                let painter = ui.painter_at(rect);
+                                let n = 48usize;
+                                for i in 0..n {
+                                    let t = i as f32 / (n - 1) as f32;
+                                    let c = egui::Rgba::from_rgb(lo[0] + (hi[0] - lo[0]) * t, lo[1] + (hi[1] - lo[1]) * t, lo[2] + (hi[2] - lo[2]) * t);
+                                    let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+                                    let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+                                    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())), 0.0, egui::Color32::from(c));
+                                }
+                            }
                         }
                     }
 

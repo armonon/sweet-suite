@@ -1241,6 +1241,10 @@ pub struct Renderer {
     /// composite shader's `* m` is `* 1.0` — i.e. the no-mask path is identical to pre-S3.
     _mask_white_tex: wgpu::Texture,
     mask_white_view: wgpu::TextureView,
+    /// The adjustment LUT fallback (256×1) — bound when an adjustment pass has no colour LUT.
+    /// Never sampled (only Gradient Map samples the LUT, and it always binds a real one).
+    _lut_identity_tex: wgpu::Texture,
+    lut_identity_view: wgpu::TextureView,
     comp_a: wgpu::Texture,
     comp_a_view: wgpu::TextureView,
     comp_b: wgpu::Texture,
@@ -1606,6 +1610,19 @@ impl Renderer {
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let mask_white_view = mask_white_tex.create_view(&Default::default());
+
+        // Adjustment LUT fallback (256×1, never sampled — see field doc).
+        let lut_identity_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("adjust lut fallback"),
+            size: wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let lut_identity_view = lut_identity_tex.create_view(&Default::default());
         let layer_composite_pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("layer composite pipeline"),
@@ -1665,6 +1682,17 @@ impl Renderer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Gradient Map colour LUT (or the identity fallback).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -1878,6 +1906,8 @@ impl Renderer {
             layer_composite_pipeline,
             adjust_pipeline,
             adjust_layout,
+            _lut_identity_tex: lut_identity_tex,
+            lut_identity_view,
             active_adjustments: Vec::new(),
             _mask_white_tex: mask_white_tex,
             mask_white_view,
@@ -2383,9 +2413,14 @@ impl Renderer {
     fn record_flatten_and_adjust(&self, enc: &mut wgpu::CommandEncoder) {
         self.record_composite(enc);
 
-        let mut passes: Vec<(u32, f32, f32, f32)> = Vec::new();
+        // Each pass carries its optional colour LUT bytes (Gradient Map) alongside the scalar
+        // params, so a two-pass kind (Gaussian) shares one LUT and the rest bind the fallback.
+        let mut passes: Vec<(u32, f32, f32, f32, Option<Vec<u8>>)> = Vec::new();
         for k in &self.active_adjustments {
-            passes.extend(compositor::adjustment_passes(k));
+            let lut = compositor::adjustment_lut_bytes(k);
+            for (m, p0, p1, p2) in compositor::adjustment_passes(k) {
+                passes.push((m, p0, p1, p2, lut.clone()));
+            }
         }
         if passes.is_empty() {
             return;
@@ -2393,10 +2428,17 @@ impl Renderer {
         let (w, h) = (self.raster.width(), self.raster.height());
         let (tw, th) = (1.0 / w.max(1) as f32, 1.0 / h.max(1) as f32);
 
+        // Build the LUT textures up front (kept alive through recording); `None` → the
+        // never-sampled identity fallback.
+        let lut_texs: Vec<Option<(wgpu::Texture, wgpu::TextureView)>> = passes
+            .iter()
+            .map(|(_, _, _, _, lut)| lut.as_ref().map(|b| compositor::make_lut_texture(&self.device, &self.queue, b)))
+            .collect();
+
         // Build every param buffer + bind group up front. Even passes read the raster & write
         // comp_a; odd passes read comp_a & write the raster (a straight ping-pong).
         let mut binds = Vec::with_capacity(passes.len());
-        for (i, (mode, p0, p1, p2)) in passes.iter().enumerate() {
+        for (i, (mode, p0, p1, p2, _)) in passes.iter().enumerate() {
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("adj param"),
                 size: 32,
@@ -2411,6 +2453,7 @@ impl Renderer {
             ]);
             self.queue.write_buffer(&buf, 0, &bytes);
             let src_view = if i % 2 == 0 { self.raster.texture_view() } else { &self.comp_a_view };
+            let lut_view = lut_texs[i].as_ref().map(|(_, v)| v).unwrap_or(&self.lut_identity_view);
             let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("adj bg"),
                 layout: &self.adjust_layout,
@@ -2418,6 +2461,7 @@ impl Renderer {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.paint_sampler) },
                     wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lut_view) },
                 ],
             });
             binds.push(bg);
@@ -4896,79 +4940,25 @@ mod layer_mask_gpu_tests {
     /// fail here rather than silently corrupt the on-screen composite.
     #[test]
     fn invert_adjustment_flips_colors_on_the_gpu() {
-        const W: u32 = 2;
         let Some((device, queue)) = headless() else {
             eprintln!("skipping: no GPU adapter available");
             return;
         };
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(super::compositor::ADJUST_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
-            layout: Some(&pl),
-            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // Red input → invert → cyan.
-        let input = tex_rgba8(&device, &queue, W, 1, &[255, 0, 0, 255].repeat(W as usize));
-        let target = tex_rgba8(&device, &queue, W, 1, &[0u8; (4 * W) as usize]);
-        let iv = input.create_view(&Default::default());
-        let tv = target.create_view(&Default::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
-        // ADJ_INVERT = 8; p0/p1/p2 unused; texel + pad zero. Same 32-byte layout as the app.
-        let params: [u8; 32] = bytemuck::cast([8u32, 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0u32, 0u32]);
-        let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        queue.write_buffer(&ubuf, 0, &params);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&iv) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
-        ] });
-
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &tv, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, ..Default::default() });
-            rp.set_pipeline(&pipeline);
-            rp.set_bind_group(0, &bg, &[]);
-            rp.draw(0..4, 0..1);
-        }
-        queue.submit(Some(enc.finish()));
-
-        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        enc.copy_texture_to_buffer(target.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } }, wgpu::Extent3d { width: W, height: 1, depth_or_array_layers: 1 });
-        queue.submit(Some(enc.finish()));
-        let slice = rb.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range();
-        let px = [data[0], data[1], data[2], data[3]];
+        // ADJ_INVERT = 8. Red → cyan.
+        let px = run_adjust(&device, &queue, 8, [0.0, 0.0, 0.0], [255, 0, 0, 255], None);
         assert!(near(px, [0, 255, 255, 255]), "Invert of red should be cyan, got {px:?}");
     }
 
     /// Run one `ADJUST_WGSL` pass with `(mode, p0, p1, p2)` over a solid input color; return
     /// the output pixel. Same pipeline the app's adjustment path uses.
-    fn run_adjust(device: &wgpu::Device, queue: &wgpu::Queue, mode: u32, p: [f32; 3], input: [u8; 4]) -> [u8; 4] {
+    fn run_adjust(device: &wgpu::Device, queue: &wgpu::Queue, mode: u32, p: [f32; 3], input: [u8; 4], lut: Option<Vec<u8>>) -> [u8; 4] {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
                 wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(super::compositor::ADJUST_WGSL.into()) });
@@ -4989,10 +4979,15 @@ mod layer_mask_gpu_tests {
         let params: [u8; 32] = bytemuck::cast([mode, p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0u32, 0u32]);
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         queue.write_buffer(&ubuf, 0, &params);
+        // A 256×1 LUT (real for Gradient Map, dummy otherwise — the shader only samples it in
+        // the Gradient Map branch).
+        let lut_tex = tex_rgba8(device, queue, 256, 1, &lut.unwrap_or_else(|| vec![0u8; 256 * 4]));
+        let lv = lut_tex.create_view(&Default::default());
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&iv) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
             wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&lv) },
         ] });
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
@@ -5023,12 +5018,30 @@ mod layer_mask_gpu_tests {
         // 0.75, matching the CPU reference `tone_curve`, and endpoints stay put.
         let (s, m, h) = (0.25f32, 0.75f32, 0.75f32);
         // Input 128/255 ≈ 0.502 (linear, since the test textures are Rgba8Unorm).
-        let out = run_adjust(&device, &queue, 13, [s, m, h], [128, 128, 128, 255]);
+        let out = run_adjust(&device, &queue, 13, [s, m, h], [128, 128, 128, 255], None);
         let expect = (suite_doc::AdjustmentKind::tone_curve(128.0 / 255.0, s, m, h) * 255.0).round() as i32;
         assert!((out[0] as i32 - expect).abs() <= 3, "GPU curves ({}) should match CPU tone_curve ({expect})", out[0]);
         assert!(out[0] > 150, "raised midtone should lift a mid-gray, got {}", out[0]);
         // Identity curve is a no-op.
-        let ident = run_adjust(&device, &queue, 13, [0.25, 0.5, 0.75], [100, 150, 200, 255]);
+        let ident = run_adjust(&device, &queue, 13, [0.25, 0.5, 0.75], [100, 150, 200, 255], None);
         assert!(near(ident, [100, 150, 200, 255]), "identity curve should pass through, got {ident:?}");
+    }
+
+    #[test]
+    fn gradient_map_remaps_luminance_through_the_lut_on_the_gpu() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // Gradient map black→red (lo=black, hi=red): a bright (white) input → red; a dark
+        // input → near-black. ADJ_GRADIENT_MAP = 14; the colours ride the LUT, not the params.
+        let gm = suite_doc::AdjustmentKind::GradientMap { lo: [0.0, 0.0, 0.0], hi: [1.0, 0.0, 0.0] };
+        let lut = super::compositor::adjustment_lut_bytes(&gm).unwrap();
+        // White (luma≈1) maps to hi = red.
+        let white = run_adjust(&device, &queue, 14, [0.0, 0.0, 0.0], [255, 255, 255, 255], Some(lut.clone()));
+        assert!(near(white, [255, 0, 0, 255]), "white through black→red gradient map should be red, got {white:?}");
+        // Black (luma=0) maps to lo = black.
+        let black = run_adjust(&device, &queue, 14, [0.0, 0.0, 0.0], [0, 0, 0, 255], Some(lut));
+        assert!(black[0] < 20 && black[1] < 20 && black[2] < 20, "black should map to lo (≈black), got {black:?}");
     }
 }

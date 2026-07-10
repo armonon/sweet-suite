@@ -191,7 +191,14 @@ pub enum AdjustmentKind {
     /// 0.75 (`shadow` / `mid` / `high`). Identity = `0.25 / 0.5 / 0.75`. Applied in linear
     /// light, like the other adjustments here.
     Curves { shadow: f32, mid: f32, high: f32 },
+    /// Gradient map: remap each pixel's luminance to a colour along the `lo`→`hi` gradient
+    /// (dark tones → `lo`, bright tones → `hi`). A popular grading/duotone look. Baked to a
+    /// 256-entry colour LUT and sampled on the GPU.
+    GradientMap { lo: [f32; 3], hi: [f32; 3] },
 }
+
+/// Rec.709 luminance weights (linear light) — shared by the luminance-based adjustments.
+pub const LUMA_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
 
 impl AdjustmentKind {
     pub fn label(&self) -> &'static str {
@@ -210,6 +217,24 @@ impl AdjustmentKind {
             Self::EdgeDetect => "Edge Detect",
             Self::GaussianBlur { .. } => "Gaussian Blur",
             Self::Curves { .. } => "Curves",
+            Self::GradientMap { .. } => "Gradient Map",
+        }
+    }
+
+    /// Bake a `GradientMap`'s `lo`→`hi` gradient into a 256-entry RGB LUT (linear light),
+    /// indexed by luminance. Returns `None` for every other kind. The GPU uploads this as a
+    /// 256×1 texture; the CPU reference (`apply_linear`) samples it directly.
+    pub fn gradient_lut(&self) -> Option<Vec<[f32; 3]>> {
+        match *self {
+            Self::GradientMap { lo, hi } => Some(
+                (0..256)
+                    .map(|i| {
+                        let t = i as f32 / 255.0;
+                        [lo[0] + (hi[0] - lo[0]) * t, lo[1] + (hi[1] - lo[1]) * t, lo[2] + (hi[2] - lo[2]) * t]
+                    })
+                    .collect(),
+            ),
+            _ => None,
         }
     }
 
@@ -272,6 +297,10 @@ impl AdjustmentKind {
                 Self::tone_curve(g, shadow, mid, high),
                 Self::tone_curve(b, shadow, mid, high),
             ],
+            Self::GradientMap { lo, hi } => {
+                let luma = (LUMA_WEIGHTS[0] * r + LUMA_WEIGHTS[1] * g + LUMA_WEIGHTS[2] * b).clamp(0.0, 1.0);
+                [lo[0] + (hi[0] - lo[0]) * luma, lo[1] + (hi[1] - lo[1]) * luma, lo[2] + (hi[2] - lo[2]) * luma]
+            }
             // BrightnessContrast / HueSaturation / Levels are owned by the GPU path.
             _ => rgb,
         }
@@ -294,6 +323,7 @@ impl AdjustmentKind {
             Self::EdgeDetect,
             Self::GaussianBlur { radius: 4.0 },
             Self::Curves { shadow: 0.25, mid: 0.5, high: 0.75 },
+            Self::GradientMap { lo: [0.05, 0.0, 0.2], hi: [1.0, 0.85, 0.4] },
         ]
     }
 }
@@ -3073,9 +3103,20 @@ mod tests {
             [0.4, 0.2, 0.7]
         ));
         // All kinds have a label and the picker enumerates them.
-        assert_eq!(AdjustmentKind::all_defaults().len(), 14);
+        assert_eq!(AdjustmentKind::all_defaults().len(), 15);
         assert_eq!(AdjustmentKind::Invert.label(), "Invert");
         assert_eq!(AdjustmentKind::EdgeDetect.label(), "Edge Detect");
+        // Gradient map: black pixel → lo colour, white pixel → hi colour, and the baked LUT
+        // has 256 entries whose ends match lo/hi.
+        let gm = AdjustmentKind::GradientMap { lo: [0.1, 0.0, 0.0], hi: [0.0, 0.0, 0.9] };
+        assert_eq!(gm.apply_linear([0.0, 0.0, 0.0]), [0.1, 0.0, 0.0], "black maps to lo");
+        assert_eq!(gm.apply_linear([1.0, 1.0, 1.0]), [0.0, 0.0, 0.9], "white maps to hi");
+        let lut = gm.gradient_lut().unwrap();
+        assert_eq!(lut.len(), 256);
+        assert_eq!(lut[0], [0.1, 0.0, 0.0]);
+        assert_eq!(lut[255], [0.0, 0.0, 0.9]);
+        assert!(AdjustmentKind::Invert.gradient_lut().is_none(), "non-gradient kinds have no LUT");
+        assert_eq!(gm.label(), "Gradient Map");
         // Tone curve: identity passes through; a raised midtone lifts a mid-gray, and the
         // fixed endpoints stay put.
         let ident = AdjustmentKind::Curves { shadow: 0.25, mid: 0.5, high: 0.75 };
