@@ -768,7 +768,8 @@ pub fn draw_shell(
                         }
                     });
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("   opacity").color(TEXT_2).small());
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Opacity").color(TEXT_2).small());
                         let mut op = info.opacity;
                         if ui.add(egui::Slider::new(&mut op, 0.0..=1.0)).changed() {
                             state.pending_layer_cmd = Some(LayerCmd::SetOpacity(i, op));
@@ -777,7 +778,8 @@ pub fn draw_shell(
                     // Per-layer blend mode (disabled-looking on the bottom layer, which has
                     // nothing to blend with, but harmless to set).
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("   blend").color(TEXT_2).small());
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Blend").color(TEXT_2).small());
                         egui::ComboBox::from_id_salt(("layer_blend", i))
                             .selected_text(info.blend.label())
                             .show_ui(ui, |ui| {
@@ -791,7 +793,8 @@ pub fn draw_shell(
                     // S3: layer mask — add (from selection or empty), clear, or (active layer)
                     // toggle whether the brush paints the colour or the mask.
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("   mask").color(TEXT_2).small());
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Mask").color(TEXT_2).small());
                         if info.has_mask {
                             if ui.small_button(RichText::new("Clear").color(TEXT_2)).clicked() {
                                 state.pending_layer_cmd = Some(LayerCmd::ClearMask(i));
