@@ -1671,3 +1671,21 @@ Refactored the ad-hoc Invert test into a reusable `run_adjust(mode, params, inpu
 The reusable `Compositor` is test-only (the app composites via the inline path), but I updated its adjust bind layout + `composite()` to bind the LUT (real or fallback) too, so it stays correct and its tests keep passing rather than leaving a latent "Gradient Map silently no-ops here" trap.
 
 The LUT infra now makes arbitrary-point Curves and duotone/Selective-Color cheap follow-ups. Next parity targets remain the read-modify-write brush tools (Clone Stamp, Dodge/Burn) and the big one, vector/Pen paths.
+
+---
+
+## Parity — Shape tool (filled Rectangle / Ellipse) — 2026-07-09
+
+Armon: "all" (keep pushing parity). Picked the Shape tool because it's high-value Photoshop parity that reuses proven, already-verified pieces — the marquee bbox-drag interaction and the selection rasterizer — so almost nothing is new/risky, and the one new piece (the fill compositing) is a pure CPU function I can unit-test. The right kind of increment while interactive tools can't be driven live (computer-use locked).
+
+### What shipped
+`Tool::Shape` ("Shp"): drag a bounding box to draw a **filled** Rectangle or Ellipse (inspector picks which) in the brush colour, committed on release as one undoable edit. Feather-aware (soft shapes) and clipped to any active selection — both for free, by routing through the same machinery selections use.
+
+- **Reuse over new code:** the drag is the exact EllipseSelect bbox-drag, but it builds a shape to *fill* instead of a selection — Ellipse → `SelectionShape::Ellipse`, Rectangle → a 4-point `SelectionShape::Polygon`. Commit-on-release mirrors Gradient/Move (a live outline overlay during the drag; the pixels change once, on mouse-up).
+- `Renderer::paint_fill_shape` rasterizes the shape's coverage (`rasterize_selection_mask` — the same fn selections use), feathers it by `selection_feather`, clips it to the active selection (`selection_coverage_mask` — reused from layer masks), and composites the brush colour through the new pure `fill_shape_pixels` (source-over in linear space via the shared `composite_over`).
+
+### Verified
+The one genuinely new piece — `fill_shape_pixels` — has a CPU unit test: fills the covered texels with the colour, leaves uncovered ones untouched, and a selection clip correctly suppresses covered-but-deselected texels. Everything else (the drag, the rasterizer, the compositing) is code already verified elsewhere. 108 workspace tests green (1 new), no warnings. The drag interaction itself is unverified-live (same computer-use-lock gap as this session's other interactive work), but it's byte-identical in structure to the EllipseSelect drag I *did* verify on screen earlier.
+
+### Scope
+v1 is filled Rect/Ellipse. Stroked outlines, rounded rects, polygons/stars, and true vector (non-destructive) shapes are follow-ups — the last of which is the Pen/vector architecture, still the biggest remaining parity gap.

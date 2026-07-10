@@ -498,6 +498,24 @@ fn composite_over(dst: &mut [u8], di: usize, sr: f32, sg: f32, sb: f32, sa: f32)
     dst[di + 3] = (oa.clamp(0.0, 1.0) * 255.0).round() as u8;
 }
 
+/// **Pure**: composite a solid `color` (linear RGBA) into `pixels` (sRGB-encoded RGBA8)
+/// wherever `coverage` (0..255, one byte/texel) marks a shape, optionally clipped by `sel`
+/// coverage. Source-over in linear space (via `composite_over`). Used by the Shape tool's
+/// fill; extracted so the compositing is unit-testable without a GPU.
+pub fn fill_shape_pixels(pixels: &mut [u8], coverage: &[u8], sel: Option<&[u8]>, color: [f32; 4]) {
+    for i in 0..coverage.len() {
+        let mut cov = coverage[i] as f32 / 255.0;
+        if let Some(s) = sel {
+            cov *= s[i] as f32 / 255.0;
+        }
+        let sa = color[3].clamp(0.0, 1.0) * cov;
+        if sa <= 0.0 {
+            continue;
+        }
+        composite_over(pixels, i * 4, color[0], color[1], color[2], sa);
+    }
+}
+
 /// **Pure** gradient fill over an RGBA8 (sRGB-encoded) buffer. Interpolates `color_a`→
 /// `color_b` (linear RGBA) along the from→to vector (`radial=false`) or radially from
 /// `from_uv` (`radial=true`), then source-over composites in linear space. `selection`
@@ -3239,6 +3257,27 @@ impl Renderer {
         self.write_active_layer_undoable(&pixels);
     }
 
+    /// **Shape tool**: fill `shape` (Ellipse/Polygon, UV space) on the active layer with
+    /// solid `color` (linear RGBA), as one undoable edit. The shape's coverage is feathered by
+    /// `selection_feather` (soft shapes) and clipped to any active selection. Reuses the
+    /// selection rasterizer + the shared source-over compositing.
+    pub fn paint_fill_shape(&mut self, shape: &SelectionShape, color: [f32; 4]) {
+        let (w, h) = {
+            let c = &self.layers[self.active_layer].canvas;
+            (c.width() as usize, c.height() as usize)
+        };
+        let mut pixels = self.read_active_layer_rgba();
+        let mut coverage = rasterize_selection_mask(w, h, shape);
+        let r = self.selection_feather.round().max(0.0) as usize;
+        if r > 0 {
+            coverage = feather_mask(&coverage, w, h, r);
+        }
+        // Clip to the active selection (rect or exact shape), if any.
+        let sel = self.selection_coverage_mask(w, h);
+        fill_shape_pixels(&mut pixels, &coverage, sel.as_deref(), color);
+        self.write_active_layer_undoable(&pixels);
+    }
+
     /// **Layer transform** on the active layer's pixels: flip/180°-rotate as a single
     /// undoable edit. Operates on a CPU readback then re-uploads. Always dimension-preserving
     /// (see `LayerTransform`'s doc comment) — a 90° rotation is `rotate_canvas_90` instead.
@@ -4200,7 +4239,7 @@ fn make_render_pipeline_no_vbo(
 
 #[cfg(test)]
 mod m4_tests {
-    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, color_range_mask, crop_pixels, feather_mask, flood_fill_mask, morph_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, smooth_mask, LayerTransform, SelectionShape};
+    use super::{apply_free_transform, apply_gradient_fill, apply_layer_transform, color_range_mask, crop_pixels, feather_mask, fill_shape_pixels, flood_fill_mask, morph_mask, move_selection_pixels, rasterize_selection_mask, rotate_canvas_pixels, selection_shape_bounds, shift_pixels, smooth_mask, LayerTransform, SelectionShape};
 
     /// A width×height buffer where each texel encodes its (x,y) into R,G so transforms are
     /// verifiable — deliberately non-square by default (M5) to catch width/height mixups
@@ -4641,6 +4680,28 @@ mod m4_tests {
         let mask = vec![255u8; w * h];
         let out = feather_mask(&mask, w, h, 4);
         assert!(out.iter().all(|&v| v == 255), "a full mask must stay full after feathering");
+    }
+
+    #[test]
+    fn fill_shape_paints_inside_the_coverage_and_leaves_the_rest() {
+        // 4×1 buffer, opaque black paper. Coverage marks the left two texels fully; fill red.
+        let (w, h) = (4, 1);
+        let mut buf = vec![0u8; w * h * 4];
+        for p in buf.chunks_mut(4) {
+            p[3] = 255; // black, opaque
+        }
+        let coverage = [255u8, 255, 0, 0];
+        fill_shape_pixels(&mut buf, &coverage, None, [1.0, 0.0, 0.0, 1.0]);
+        // Covered texels → red; uncovered → untouched black.
+        assert!(buf[0] > 240 && buf[1] < 15 && buf[2] < 15, "covered texel 0 should be red: {:?}", &buf[0..4]);
+        assert_eq!(&buf[8..12], &[0, 0, 0, 255], "uncovered texel 2 stays black");
+        // A selection clip zeroes the coverage where the selection is 0.
+        let mut buf2 = vec![0u8; w * h * 4];
+        for p in buf2.chunks_mut(4) { p[3] = 255; }
+        let sel = [0u8, 255, 0, 0]; // only texel 1 selected
+        fill_shape_pixels(&mut buf2, &coverage, Some(&sel), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(&buf2[0..4], &[0, 0, 0, 255], "texel 0 covered but deselected → untouched");
+        assert!(buf2[4] > 240, "texel 1 covered AND selected → red");
     }
 
     #[test]

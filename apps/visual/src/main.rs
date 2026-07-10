@@ -672,6 +672,21 @@ impl ApplicationHandler for App {
                             self.input.move_preview = None;
                             self.shell.move_preview = None;
                         }
+                        // Shape: fill the drawn shape with the brush colour on release.
+                        if self.shell.tool == tools::Tool::Shape {
+                            if let Some(shape) = self.input.shape_preview.take() {
+                                // Skip a degenerate (zero-area) shape from a click without a drag.
+                                let [x0, y0, x1, y1] = suite_gpu::selection_shape_bounds(&shape);
+                                if (x1 - x0) > 1e-3 && (y1 - y0) > 1e-3 {
+                                    renderer.paint_fill_shape(&shape, self.shell.brush.color);
+                                    self.undo_order.push(UndoKind::Paint);
+                                    self.redo_order.clear();
+                                    self.shell.dirty = true;
+                                }
+                            }
+                            self.input.shape_drag_start = None;
+                            self.shell.shape_preview = None;
+                        }
                         // Free Transform: commit the accumulated scale/rotation from the
                         // recorded drag on release — same commit-on-release shape as Move.
                         if self.shell.tool == tools::Tool::FreeTransform {
@@ -1053,6 +1068,8 @@ impl ApplicationHandler for App {
                 self.shell.gradient_preview = self.input.gradient_preview;
                 // Move guide line: same sync.
                 self.shell.move_preview = self.input.move_preview;
+                // Shape tool: mirror the in-progress shape out for the overlay.
+                self.shell.shape_preview = self.input.shape_preview.clone();
                 // Free Transform (M4c): same sync — read-only from the overlay/inspector's
                 // point of view, so input → shell is the only direction needed.
                 self.shell.transform_mode = self.input.transform_mode;

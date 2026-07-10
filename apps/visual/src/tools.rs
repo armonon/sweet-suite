@@ -26,6 +26,7 @@ pub enum Tool {
     MoveLayer,
     FreeTransform,
     Text,
+    Shape,
     AddCube,
     AddSphere,
     AddImage,
@@ -50,6 +51,7 @@ impl Tool {
             Self::MoveLayer => "Move Layer",
             Self::FreeTransform => "Free Transform",
             Self::Text => "Text",
+            Self::Shape => "Shape",
             Self::AddCube => "Add Cube",
             Self::AddSphere => "Add Sphere",
             Self::AddImage => "Add Image Plane",
@@ -73,6 +75,7 @@ impl Tool {
             Self::MoveLayer => "Drag on the canvas to move the active layer's pixels. With an active selection, only the selected pixels move (leaving a transparent hole). V to activate.",
             Self::FreeTransform => "Drag a corner handle to scale (anchored at the opposite corner) or the handle above the box to rotate. Selection-aware like Move. Each drag commits as its own undo step on release. T to activate.",
             Self::Text => "Click the canvas to set where text starts, then type in the inspector and press Apply. Load a .ttf font first. Single-line only — no wrapping/kerning yet.",
+            Self::Shape => "Drag to draw a filled rectangle or ellipse in the brush colour (pick which in the inspector). Feather softens the edge; an active selection clips it.",
             Self::AddCube => "Adds a unit cube where you click and selects it.",
             Self::AddSphere => "Adds a unit sphere where you click and selects it.",
             Self::AddImage => "Adds a textured image plane where you click and selects it.",
@@ -147,6 +150,10 @@ pub struct InputState {
     pub select_extra: Option<suite_gpu::SelectionShape>,
     /// EllipseSelect drag start UV `[u, v]`, set on press (same shape as `select_drag_start`).
     pub ellipse_drag_start: Option<[f32; 2]>,
+    /// Shape tool: drag-start UV, and the shape being drawn (mirrors EllipseSelect, but the
+    /// shape is *filled* on release instead of becoming a selection).
+    pub shape_drag_start: Option<[f32; 2]>,
+    pub shape_preview: Option<suite_gpu::SelectionShape>,
     /// Lasso: the freehand point path traced so far this drag, in UV space. Cleared on
     /// press, appended on every cursor move while dragging, rasterized into a `Polygon`
     /// selection on release.
@@ -502,6 +509,25 @@ pub fn handle_cursor_moved(
         return;
     }
 
+    // Held drag — Shape: same bbox drag as EllipseSelect, but builds a shape to FILL on
+    // release (Ellipse, or a rectangle as a 4-point Polygon), per the inspector's shape kind.
+    if shell.tool == Tool::Shape && input.left_pressed {
+        let (l, t, r, b) = shell.canvas_rect(renderer.size());
+        let cw = (r - l).max(1.0);
+        let ch = (b - t).max(1.0);
+        let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+        let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+        if let Some([u0, v0]) = input.shape_drag_start {
+            let (x0, y0, x1, y1) = (u.min(u0), v.min(v0), u.max(u0), v.max(v0));
+            input.shape_preview = Some(if shell.shape_kind == crate::shell::ShapeKind::Ellipse {
+                suite_gpu::SelectionShape::Ellipse { cx: (x0 + x1) * 0.5, cy: (y0 + y1) * 0.5, rx: (x1 - x0) * 0.5, ry: (y1 - y0) * 0.5 }
+            } else {
+                suite_gpu::SelectionShape::Polygon(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+            });
+        }
+        return;
+    }
+
     // Held drag — Lasso: append the cursor's UV position to the traced point path. Also
     // sets `select_extra` live (not just on release) so the overlay can draw the growing
     // outline using the exact same Polygon-drawing path as the finalized selection.
@@ -782,6 +808,15 @@ pub fn handle_left_press(
             input.lasso_points.push([u, v]);
             input.select_rect = Some([u, v, u, v]);
             input.select_extra = None; // needs >= 2 points before it's a real shape
+        }
+        Tool::Shape => {
+            let (l, t, r, b) = canvas;
+            let cw = (r - l).max(1.0);
+            let ch = (b - t).max(1.0);
+            let u = ((input.cursor.0 - l) / cw).clamp(0.0, 1.0);
+            let v = ((input.cursor.1 - t) / ch).clamp(0.0, 1.0);
+            input.shape_drag_start = Some([u, v]);
+            input.shape_preview = None; // a real shape appears once the drag has area
         }
         Tool::Gradient => {
             // Record the gradient start point in UV; the drag sets the endpoint, release fills.

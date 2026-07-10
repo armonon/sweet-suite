@@ -27,6 +27,13 @@ pub enum FileAction {
     LoadFont,
 }
 
+/// Which primitive the Shape tool draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShapeKind {
+    Rect,
+    Ellipse,
+}
+
 /// A command from the Layers panel; main.rs applies it to the renderer's layer stack.
 #[derive(Clone, Copy, Debug)]
 pub enum LayerCmd {
@@ -142,6 +149,10 @@ pub struct ShellState {
     /// Live Move-tool guide endpoints `[u0, v0, u1, v1]` (UV), synced from `InputState`
     /// before each frame so the overlay can draw the drag line.
     pub move_preview: Option<[f32; 4]>,
+    /// Shape tool: which primitive to draw, and the in-progress shape (synced from input) for
+    /// the drag overlay.
+    pub shape_kind: ShapeKind,
+    pub shape_preview: Option<suite_gpu::SelectionShape>,
     /// Free Transform (M4c): which handle is being dragged, synced from `InputState` before
     /// each frame — the overlay draws the box + handles whenever the tool is active, and the
     /// live transformed-box preview additionally whenever this is `Some`.
@@ -228,6 +239,8 @@ impl Default for ShellState {
             gradient_radial: false,
             gradient_preview: None,
             move_preview: None,
+            shape_kind: ShapeKind::Rect,
+            shape_preview: None,
             transform_mode: None,
             transform_scale: 1.0,
             transform_rotation: 0.0,
@@ -507,6 +520,7 @@ pub fn draw_shell(
                     (Tool::MoveLayer, "MovL", "V"),
                     (Tool::FreeTransform, "Xfrm", "T"),
                     (Tool::Text, "Txt", "·"),
+                    (Tool::Shape, "Shp", "·"),
                     (Tool::AddCube, "Cub", "3"),
                     (Tool::AddSphere, "Sph", "4"),
                     (Tool::AddImage, "Img", "5"),
@@ -544,7 +558,7 @@ pub fn draw_shell(
                             Tool::Select | Tool::Translate | Tool::Paint
                             | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
                             | Tool::Gradient | Tool::MoveLayer | Tool::FreeTransform
-                            | Tool::Text | Tool::Eyedropper => {
+                            | Tool::Text | Tool::Shape | Tool::Eyedropper => {
                                 state.tool = tool
                             }
                             Tool::AddCube => {
@@ -1006,6 +1020,29 @@ pub fn draw_shell(
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new("Uses the brush colour. Single line only (no wrapping/kerning/bidi). TrueType (.ttf) glyf outlines only — not OTF/CFF or composite glyphs (accented characters may render blank). ⌘Z undoes.")
+                        .color(TEXT_2)
+                        .small(),
+                );
+                ui.add_space(12.0);
+            }
+
+            if state.tool == Tool::Shape {
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Shape").color(TEXT_0).strong());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Kind").color(TEXT_2));
+                    if ui.selectable_label(state.shape_kind == ShapeKind::Rect, RichText::new("Rectangle").color(TEXT_1)).clicked() {
+                        state.shape_kind = ShapeKind::Rect;
+                    }
+                    if ui.selectable_label(state.shape_kind == ShapeKind::Ellipse, RichText::new("Ellipse").color(TEXT_1)).clicked() {
+                        state.shape_kind = ShapeKind::Ellipse;
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Drag on the canvas to draw a filled shape in the brush colour. The Feather (in a selection tool) softens the edge; an active selection clips it. ⌘Z undoes.")
                         .color(TEXT_2)
                         .small(),
                 );
@@ -1805,6 +1842,26 @@ pub fn draw_shell(
         }
         // Request continuous repaint so the ants march.
         ui.ctx().request_repaint();
+    }
+
+    // Shape preview outline while dragging (the fill commits on release).
+    if let Some(shape) = &state.shape_preview {
+        let rect = canvas_rect;
+        let to_screen = |u: f32, v: f32| egui::pos2(rect.left() + u * rect.width(), rect.top() + v * rect.height());
+        let pts: Vec<egui::Pos2> = match shape {
+            suite_gpu::SelectionShape::Ellipse { cx, cy, rx, ry } => (0..=48)
+                .map(|i| {
+                    let a = (i as f32 / 48.0) * std::f32::consts::TAU;
+                    to_screen(cx + rx * a.cos(), cy + ry * a.sin())
+                })
+                .collect(),
+            suite_gpu::SelectionShape::Polygon(points) => points.iter().chain(points.first()).map(|p| to_screen(p[0], p[1])).collect(),
+            _ => Vec::new(),
+        };
+        if pts.len() >= 2 {
+            painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(2.0, egui::Color32::BLACK)));
+            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, egui::Color32::WHITE)));
+        }
     }
 
     // Gradient guide line while dragging (start → endpoint), with end caps.
