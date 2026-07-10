@@ -413,8 +413,11 @@ pub fn draw_shell(
         )
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("SWEET · Visual").color(TEXT_0).strong());
-                ui.add_space(12.0);
+                ui.label(RichText::new("SWEET").color(ACCENT).strong());
+                ui.label(RichText::new("Visual").color(TEXT_2).small());
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
                 // File actions — record the intent; main.rs runs the dialog after the frame.
                 if ui.button(RichText::new("New").color(TEXT_0)).clicked() {
                     state.pending_file_action = Some(FileAction::New);
@@ -436,7 +439,9 @@ pub fn draw_shell(
                 if ui.button(RichText::new("Save As").color(TEXT_0)).clicked() {
                     state.pending_file_action = Some(FileAction::SaveAs);
                 }
-                ui.add_space(8.0);
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
                 if ui
                     .button(RichText::new("Import Image").color(TEXT_0))
                     .on_hover_text("Open a PNG/JPG/… onto the paint canvas")
@@ -508,123 +513,126 @@ pub fn draw_shell(
                 .inner_margin(Margin::symmetric(4, 8)),
         )
         .show(ui, |ui| {
-            ui.vertical_centered_justified(|ui| {
-                for (tool, label, hotkey) in [
-                    (Tool::Select, "Sel", "1"),
-                    (Tool::Translate, "Mov", "2"),
-                    (Tool::Paint, "Pnt", "B"),
-                    (Tool::RectSelect, "Mrq", "M"),
-                    (Tool::EllipseSelect, "Elps", "·"),
-                    (Tool::Lasso, "Lso", "L"),
-                    (Tool::Gradient, "Grd", "G"),
-                    (Tool::MoveLayer, "MovL", "V"),
-                    (Tool::FreeTransform, "Xfrm", "T"),
-                    (Tool::Text, "Txt", "·"),
-                    (Tool::Shape, "Shp", "·"),
-                    (Tool::AddCube, "Cub", "3"),
-                    (Tool::AddSphere, "Sph", "4"),
-                    (Tool::AddImage, "Img", "5"),
-                    (Tool::AddMesh, "Msh", "6"),
-                    (Tool::AddLathe, "Lth", "7"),
-                    (Tool::AddPipe, "Pip", "8"),
-                    (Tool::Sculpt, "Sct", "S"),
-                    (Tool::MagicWand, "Wnd", "W"),
-                    (Tool::Eyedropper, "Eye", "·"),
-                ] {
-                    let selected = state.tool == tool;
-                    let bg = if selected { ACCENT_PRESS } else { BG_2 };
-                    let stroke = if selected {
-                        Stroke {
-                            width: 1.0,
-                            color: ACCENT_HOVER,
-                        }
-                    } else {
-                        Stroke {
-                            width: 1.0,
-                            color: LINE,
-                        }
-                    };
-                    let resp = ui
-                        .add_sized(
-                            [40.0, 40.0],
-                            egui::Button::new(RichText::new(label).color(TEXT_0).monospace())
-                                .corner_radius(5.0)
-                                .fill(bg)
-                                .stroke(stroke),
-                        )
-                        .on_hover_text(format!("{} ({})", tool.label(), hotkey));
-                    if resp.clicked() {
-                        match tool {
-                            Tool::Select | Tool::Translate | Tool::Paint
-                            | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
-                            | Tool::Gradient | Tool::MoveLayer | Tool::FreeTransform
-                            | Tool::Text | Tool::Shape | Tool::Eyedropper => {
-                                state.tool = tool
-                            }
-                            Tool::AddCube => {
-                                let id = doc.add(ObjectKind::Cube, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                            Tool::AddSphere => {
-                                let id = doc.add(ObjectKind::Sphere, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                            Tool::AddImage => {
-                                let id = doc.add(ObjectKind::ImagePlane, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                            Tool::AddMesh => {
-                                let id = doc.add(ObjectKind::Mesh, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                            Tool::AddLathe => {
-                                // Default vase profile: axis-symmetric, revolves around Y.
-                                let profile: &[[f32; 2]] = &[
-                                    [0.0, -1.0],  // bottom center (axis pole)
-                                    [0.6, -0.8],  // base rim
-                                    [0.7, -0.5],
-                                    [0.5, 0.0],   // waist
-                                    [0.7, 0.5],
-                                    [0.4, 0.9],   // shoulder
-                                    [0.15, 1.0],  // neck
-                                    [0.0, 1.0],   // top center (axis pole)
-                                ];
-                                let id = doc.add_lathe(profile, 32, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                            Tool::Sculpt => {
-                                state.tool = Tool::Sculpt;
-                            }
-                            Tool::MagicWand => {
-                                state.tool = Tool::MagicWand;
-                            }
-                            Tool::AddPipe => {
-                                // Demo: a 32-step helix path.
-                                let path: Vec<glam::Vec3> = (0..=32)
-                                    .map(|i| {
-                                        let t = i as f32 / 32.0;
-                                        let angle = t * std::f32::consts::TAU * 2.0;
-                                        glam::Vec3::new(angle.cos() * 1.5, t * 2.0 - 1.0, angle.sin() * 1.5)
-                                    })
-                                    .collect();
-                                // Square cross-section.
-                                let shape: &[[f32; 2]] = &[
-                                    [-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1],
-                                ];
-                                let id = doc.add_pipe(&path, shape, glam::Vec3::ZERO);
-                                doc.set_selection(Some(id));
-                                state.dirty = true;
-                            }
-                        }
-                    }
-                    ui.add_space(6.0);
+            // Grouped tool palette: compact 2-column grid, sectioned so the 2D image tools
+            // and the 3D/mesh tools read as distinct families (and all fit without scrolling).
+            let groups: [(&str, &[(Tool, &str, &str)]); 4] = [
+                ("MOVE", &[
+                    (Tool::Select, "Select", "1"),
+                    (Tool::Translate, "Move", "2"),
+                    (Tool::MoveLayer, "Nudge", "V"),
+                    (Tool::FreeTransform, "Xform", "T"),
+                ]),
+                ("SELECT", &[
+                    (Tool::RectSelect, "Rect", "M"),
+                    (Tool::EllipseSelect, "Ellipse", "·"),
+                    (Tool::Lasso, "Lasso", "L"),
+                    (Tool::MagicWand, "Wand", "W"),
+                ]),
+                ("PAINT", &[
+                    (Tool::Paint, "Brush", "B"),
+                    (Tool::Gradient, "Gradient", "G"),
+                    (Tool::Shape, "Shape", "·"),
+                    (Tool::Text, "Text", "·"),
+                    (Tool::Eyedropper, "Pick", "·"),
+                ]),
+                ("OBJECTS", &[
+                    (Tool::AddCube, "Cube", "3"),
+                    (Tool::AddSphere, "Sphere", "4"),
+                    (Tool::AddImage, "Image", "5"),
+                    (Tool::AddMesh, "Mesh", "6"),
+                    (Tool::AddLathe, "Lathe", "7"),
+                    (Tool::AddPipe, "Pipe", "8"),
+                    (Tool::Sculpt, "Sculpt", "S"),
+                ]),
+            ];
+
+            let mut clicked: Option<Tool> = None;
+            for (gi, (header, tools)) in groups.iter().enumerate() {
+                if gi > 0 {
+                    ui.add_space(8.0);
                 }
-            });
+                ui.label(RichText::new(*header).color(TEXT_2).small());
+                ui.add_space(3.0);
+                for row in tools.chunks(2) {
+                    ui.horizontal(|ui| {
+                        for &(tool, label, hotkey) in row {
+                            let selected = state.tool == tool;
+                            let bg = if selected { ACCENT_PRESS } else { BG_2 };
+                            let stroke = Stroke { width: 1.0, color: if selected { ACCENT_HOVER } else { LINE } };
+                            let txt = if selected { TEXT_0 } else { TEXT_1 };
+                            let resp = ui
+                                .add_sized(
+                                    [66.0, 30.0],
+                                    egui::Button::new(RichText::new(label).color(txt).size(12.0))
+                                        .corner_radius(5.0)
+                                        .fill(bg)
+                                        .stroke(stroke),
+                                )
+                                .on_hover_text(format!("{} ({})", tool.label(), hotkey));
+                            if resp.clicked() {
+                                clicked = Some(tool);
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            }
+
+            if let Some(tool) = clicked {
+                match tool {
+                    Tool::Select | Tool::Translate | Tool::Paint
+                    | Tool::RectSelect | Tool::EllipseSelect | Tool::Lasso
+                    | Tool::Gradient | Tool::MoveLayer | Tool::FreeTransform
+                    | Tool::Text | Tool::Shape | Tool::Eyedropper
+                    | Tool::Sculpt | Tool::MagicWand => {
+                        state.tool = tool;
+                    }
+                    Tool::AddCube => {
+                        let id = doc.add(ObjectKind::Cube, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                    Tool::AddSphere => {
+                        let id = doc.add(ObjectKind::Sphere, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                    Tool::AddImage => {
+                        let id = doc.add(ObjectKind::ImagePlane, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                    Tool::AddMesh => {
+                        let id = doc.add(ObjectKind::Mesh, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                    Tool::AddLathe => {
+                        // Default vase profile: axis-symmetric, revolves around Y.
+                        let profile: &[[f32; 2]] = &[
+                            [0.0, -1.0], [0.6, -0.8], [0.7, -0.5], [0.5, 0.0],
+                            [0.7, 0.5], [0.4, 0.9], [0.15, 1.0], [0.0, 1.0],
+                        ];
+                        let id = doc.add_lathe(profile, 32, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                    Tool::AddPipe => {
+                        // Demo: a 32-step helix path.
+                        let path: Vec<glam::Vec3> = (0..=32)
+                            .map(|i| {
+                                let t = i as f32 / 32.0;
+                                let angle = t * std::f32::consts::TAU * 2.0;
+                                glam::Vec3::new(angle.cos() * 1.5, t * 2.0 - 1.0, angle.sin() * 1.5)
+                            })
+                            .collect();
+                        let shape: &[[f32; 2]] = &[[-0.1, -0.1], [0.1, -0.1], [0.1, 0.1], [-0.1, 0.1]];
+                        let id = doc.add_pipe(&path, shape, glam::Vec3::ZERO);
+                        doc.set_selection(Some(id));
+                        state.dirty = true;
+                    }
+                }
+            }
         });
     state.left_strip_w = left.response.rect.width();
 

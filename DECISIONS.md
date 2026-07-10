@@ -1689,3 +1689,18 @@ The one genuinely new piece — `fill_shape_pixels` — has a CPU unit test: fil
 
 ### Scope
 v1 is filled Rect/Ellipse. Stroked outlines, rounded rects, polygons/stars, and true vector (non-destructive) shapes are follow-ups — the last of which is the Pen/vector architecture, still the biggest remaining parity gap.
+
+---
+
+## UI upgrade — grouped tool palette + top-bar polish — 2026-07-09
+
+Armon: "then lets upgrade our UI." The clear eyesore was the left tool strip: a tall single column of cryptic 3-letter buttons (Sel / Mov / Pnt / Mrq / Elps / Lso / Grd / MovL / Xfrm / Txt / Cub / Sph / …), ungrouped, 2D and 3D tools jumbled together, and long enough that the object tools were scrolled off-screen.
+
+### What changed
+- **Tool palette → grouped 2-column grid.** Four labelled sections — **MOVE** (Select / Move / Nudge / Xform), **SELECT** (Rect / Ellipse / Lasso / Wand), **PAINT** (Brush / Gradient / Shape / Text / Pick), **OBJECTS** (Cube / Sphere / Image / Mesh / Lathe / Pipe / Sculpt) — laid out two-per-row so **every tool is visible at once, no scrolling**. Cryptic abbreviations replaced with readable words; the active tool fills accent-blue; tooltips still carry the full name + hotkey. The click-action `match` was factored out of the render loop (collect `clicked: Option<Tool>`, act after) so the layout code stays clean.
+- **Top bar** got a brand mark (**SWEET** in accent, "Visual" muted) and `ui.separator()` dividers grouping brand · file-ops (New/Open/Save/Save As) · asset-ops (Import/Export) · document title.
+
+### Verified
+Screenshot-verified live (Screen Recording available this session) — the palette renders crisply with all sections/labels fitting their buttons and nothing cut off, the active tool highlights, and the top-bar brand + dividers read cleanly. Pure egui layout/styling in `apps/visual/src/shell.rs` — no logic change to any tool, no test surface touched; full workspace still builds clean, 108 tests green.
+
+Next UI candidates (not blocking): inspector density/typography pass, a real app icon, and eventually swapping the text tool labels for glyph icons once a bundled icon font is in place.
