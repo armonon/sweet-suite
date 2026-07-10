@@ -4959,4 +4959,76 @@ mod layer_mask_gpu_tests {
         let px = [data[0], data[1], data[2], data[3]];
         assert!(near(px, [0, 255, 255, 255]), "Invert of red should be cyan, got {px:?}");
     }
+
+    /// Run one `ADJUST_WGSL` pass with `(mode, p0, p1, p2)` over a solid input color; return
+    /// the output pixel. Same pipeline the app's adjustment path uses.
+    fn run_adjust(device: &wgpu::Device, queue: &wgpu::Queue, mode: u32, p: [f32; 3], input: [u8; 4]) -> [u8; 4] {
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(super::compositor::ADJUST_WGSL.into()) });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None, layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None, multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })], compilation_options: Default::default() }),
+            multiview_mask: None, cache: None,
+        });
+        let inp = tex_rgba8(device, queue, 1, 1, &input);
+        let target = tex_rgba8(device, queue, 1, 1, &[0u8; 4]);
+        let iv = inp.create_view(&Default::default());
+        let tv = target.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let params: [u8; 32] = bytemuck::cast([mode, p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 0f32.to_bits(), 0f32.to_bits(), 0u32, 0u32]);
+        let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        queue.write_buffer(&ubuf, 0, &params);
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&iv) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: ubuf.as_entire_binding() },
+        ] });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &tv, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, ..Default::default() });
+            rp.set_pipeline(&pipeline);
+            rp.set_bind_group(0, &bg, &[]);
+            rp.draw(0..4, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_texture_to_buffer(target.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+        queue.submit(Some(enc.finish()));
+        let slice = rb.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        [data[0], data[1], data[2], data[3]]
+    }
+
+    #[test]
+    fn curves_adjustment_matches_the_cpu_tone_curve_on_the_gpu() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("skipping: no GPU adapter available");
+            return;
+        };
+        // ADJ_CURVES = 13. Raise the midtone (mid=0.75) — a mid-gray input should lift toward
+        // 0.75, matching the CPU reference `tone_curve`, and endpoints stay put.
+        let (s, m, h) = (0.25f32, 0.75f32, 0.75f32);
+        // Input 128/255 ≈ 0.502 (linear, since the test textures are Rgba8Unorm).
+        let out = run_adjust(&device, &queue, 13, [s, m, h], [128, 128, 128, 255]);
+        let expect = (suite_doc::AdjustmentKind::tone_curve(128.0 / 255.0, s, m, h) * 255.0).round() as i32;
+        assert!((out[0] as i32 - expect).abs() <= 3, "GPU curves ({}) should match CPU tone_curve ({expect})", out[0]);
+        assert!(out[0] > 150, "raised midtone should lift a mid-gray, got {}", out[0]);
+        // Identity curve is a no-op.
+        let ident = run_adjust(&device, &queue, 13, [0.25, 0.5, 0.75], [100, 150, 200, 255]);
+        assert!(near(ident, [100, 150, 200, 255]), "identity curve should pass through, got {ident:?}");
+    }
 }

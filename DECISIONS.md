@@ -1629,3 +1629,24 @@ Added a headless-GPU test that runs the exact `ADJUST_WGSL` with the Invert mode
 `self.raster`/`comp_a` are `Rgba8UnormSrgb`, so the adjust shader samples sRGB→linear and writes linear→sRGB automatically — i.e. the adjustment math runs in linear space, identical to how it runs in the `Compositor`'s `Rgba16Float` path. The only difference is 8-bit vs 16-bit precision (and HDR headroom for >1.0 exposure), the same tradeoff the inline layer composite already makes vs. the reference `Compositor`.
 
 Next: the eyes-on confirmation of adjustments on the live canvas once Screen Recording is stable; otherwise this closes the "adjustments do nothing on screen" gap that made them feel broken.
+
+---
+
+## Parity — Curves adjustment (tone curve) — 2026-07-07
+
+Armon: "yes" (keep pushing Photoshop parity). Picked Curves — the marquee "pro" photo adjustment — because it rides the adjustment-layer pipeline I'd just wired to the live canvas and verified on screen, so the risky infrastructure was already proven.
+
+### What shipped
+`AdjustmentKind::Curves { shadow, mid, high }`: a 5-knot piecewise-linear tone curve with fixed `(0,0)`/`(1,1)` endpoints and three draggable interior control outputs at inputs 0.25 / 0.5 / 0.75, applied per channel. The inspector shows a real **draggable curve editor** (drag the three points; the curve and a faint identity diagonal redraw live). It flows through the exact `record_flatten_and_adjust` path, so it updates the canvas the instant you drag.
+
+### The design choice that kept it cheap
+A full Photoshop curve is arbitrary-point, which would need a LUT and a wider uniform — touching the shared `AdjParams` layout and the `adjustment_passes` tuple in both the reusable `Compositor` and the Renderer's live path. Instead, a **3-interior-point** curve fits the *existing* 3-float `AdjParams` (`p0/p1/p2` = shadow/mid/high) exactly — so Curves slotted in as one more `mode` with **zero param-plumbing churn**: a new enum variant, one `adjustment_passes` arm, one shader `case 13u`, and the UI. Honest scope: it's a 3-point tone curve, not arbitrary-point (more points = a later LUT-based follow-up); still a genuine curve tool, clearly more than Levels.
+
+The math lives once as `AdjustmentKind::tone_curve` (CPU) and is mirrored by `curve5` in `ADJUST_WGSL` — the inspector's curve preview, the CPU reference tests, and the GPU shader all evaluate the same 5-knot interpolation. Applied in linear light, consistent with every other adjustment in this codebase (Levels/Brightness already work in linear).
+
+### Verified
+- CPU: `tone_curve` identity is a no-op, a raised midtone lifts a mid-gray, endpoints stay fixed.
+- **GPU (real hardware):** a headless test runs the exact `ADJUST_WGSL` Curves pass and asserts the GPU output matches the CPU `tone_curve` for a raised-midtone curve (and identity passes through) — so the WGSL `curve5` provably matches the CPU reference, not just "looks right." A reusable `run_adjust` test helper was extracted for this (any adjustment mode + params → output pixel).
+- 105 workspace tests green (2 new), no warnings. Live drag-the-curve verification pending the packaged build (Screen Recording is working again this session).
+
+Next: arbitrary-point curves (LUT), per-channel R/G/B curves, and the bigger untouched Photoshop families (pen/vector paths is the largest remaining gap).

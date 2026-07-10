@@ -1322,6 +1322,34 @@ pub fn draw_shell(
                                     changed |= ui.add(egui::Slider::new(radius, 1.0..=16.0)).changed();
                                 });
                             }
+                            suite_doc::AdjustmentKind::Curves { shadow, mid, high } => {
+                                ui.label(RichText::new("Drag the three points to reshape tones (endpoints fixed).").color(TEXT_2).small());
+                                // Draggable 5-knot tone-curve editor.
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(184.0, 184.0), egui::Sense::hover());
+                                let painter = ui.painter_at(rect);
+                                painter.rect_filled(rect, 2.0, egui::Color32::from_gray(26));
+                                let to_screen = |x: f32, y: f32| egui::pos2(rect.left() + x * rect.width(), rect.bottom() - y * rect.height());
+                                // Faint identity diagonal for reference.
+                                painter.line_segment([to_screen(0.0, 0.0), to_screen(1.0, 1.0)], egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                                // The curve itself, sampled from the shared tone_curve fn.
+                                let curve_pts: Vec<egui::Pos2> = (0..=64)
+                                    .map(|i| { let x = i as f32 / 64.0; to_screen(x, suite_doc::AdjustmentKind::tone_curve(x, *shadow, *mid, *high)) })
+                                    .collect();
+                                painter.add(egui::Shape::line(curve_pts, egui::Stroke::new(1.6, TEXT_0)));
+                                // Three draggable interior handles at x = 0.25 / 0.5 / 0.75.
+                                for (idx, (xk, yk)) in [(0.25f32, &mut *shadow), (0.5, &mut *mid), (0.75, &mut *high)].into_iter().enumerate() {
+                                    let center = to_screen(xk, *yk);
+                                    let hit = egui::Rect::from_center_size(center, egui::vec2(16.0, 16.0));
+                                    let resp = ui.interact(hit, ui.id().with(("curvept", idx)), egui::Sense::drag());
+                                    painter.circle_filled(center, 4.5, egui::Color32::WHITE);
+                                    if let Some(p) = resp.interact_pointer_pos() {
+                                        if resp.dragged() {
+                                            *yk = ((rect.bottom() - p.y) / rect.height()).clamp(0.0, 1.0);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 

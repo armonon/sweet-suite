@@ -186,6 +186,11 @@ pub enum AdjustmentKind {
     EdgeDetect,
     /// Separable Gaussian blur, `radius` in texels (two 1-D GPU passes, GPU-only).
     GaussianBlur { radius: f32 },
+    /// Tone curve: a 5-knot piecewise-linear map applied per channel, with fixed endpoints
+    /// `(0,0)`/`(1,1)` and three draggable interior control outputs at inputs 0.25 / 0.5 /
+    /// 0.75 (`shadow` / `mid` / `high`). Identity = `0.25 / 0.5 / 0.75`. Applied in linear
+    /// light, like the other adjustments here.
+    Curves { shadow: f32, mid: f32, high: f32 },
 }
 
 impl AdjustmentKind {
@@ -204,7 +209,25 @@ impl AdjustmentKind {
             Self::Sharpen { .. } => "Sharpen",
             Self::EdgeDetect => "Edge Detect",
             Self::GaussianBlur { .. } => "Gaussian Blur",
+            Self::Curves { .. } => "Curves",
         }
+    }
+
+    /// Evaluate the 5-knot piecewise-linear tone curve at `x∈[0,1]` given the three interior
+    /// control outputs. Fixed endpoints `(0,0)`/`(1,1)`. Kept in lock-step with the WGSL
+    /// `curve5` in `ADJUST_WGSL` so the CPU reference and the GPU agree.
+    pub fn tone_curve(x: f32, shadow: f32, mid: f32, high: f32) -> f32 {
+        let xc = x.clamp(0.0, 1.0);
+        let knots = [(0.0, 0.0), (0.25, shadow), (0.5, mid), (0.75, high), (1.0, 1.0)];
+        for i in 0..4 {
+            let (x0, y0) = knots[i];
+            let (x1, y1) = knots[i + 1];
+            if xc <= x1 {
+                let t = (xc - x0) / (x1 - x0);
+                return y0 + t * (y1 - y0);
+            }
+        }
+        1.0
     }
 
     /// CPU reference implementation of the per-pixel adjustment math, mirroring the
@@ -244,6 +267,11 @@ impl AdjustmentKind {
                 [v, v, v]
             }
             Self::Invert => [1.0 - clamp01(r), 1.0 - clamp01(g), 1.0 - clamp01(b)],
+            Self::Curves { shadow, mid, high } => [
+                Self::tone_curve(r, shadow, mid, high),
+                Self::tone_curve(g, shadow, mid, high),
+                Self::tone_curve(b, shadow, mid, high),
+            ],
             // BrightnessContrast / HueSaturation / Levels are owned by the GPU path.
             _ => rgb,
         }
@@ -265,6 +293,7 @@ impl AdjustmentKind {
             Self::Sharpen { amount: 0.5 },
             Self::EdgeDetect,
             Self::GaussianBlur { radius: 4.0 },
+            Self::Curves { shadow: 0.25, mid: 0.5, high: 0.75 },
         ]
     }
 }
@@ -3044,9 +3073,18 @@ mod tests {
             [0.4, 0.2, 0.7]
         ));
         // All kinds have a label and the picker enumerates them.
-        assert_eq!(AdjustmentKind::all_defaults().len(), 13);
+        assert_eq!(AdjustmentKind::all_defaults().len(), 14);
         assert_eq!(AdjustmentKind::Invert.label(), "Invert");
         assert_eq!(AdjustmentKind::EdgeDetect.label(), "Edge Detect");
+        // Tone curve: identity passes through; a raised midtone lifts a mid-gray, and the
+        // fixed endpoints stay put.
+        let ident = AdjustmentKind::Curves { shadow: 0.25, mid: 0.5, high: 0.75 };
+        let v = ident.apply_linear([0.5, 0.5, 0.5]);
+        assert!((v[0] - 0.5).abs() < 1e-6, "identity curve is a no-op at 0.5: {v:?}");
+        let lift = AdjustmentKind::Curves { shadow: 0.25, mid: 0.75, high: 0.75 };
+        assert!(lift.apply_linear([0.5, 0.5, 0.5])[0] > 0.7, "raised midtone lifts a mid-gray");
+        assert_eq!(lift.apply_linear([0.0, 1.0, 0.0]), [0.0, 1.0, 0.0], "endpoints are fixed at 0 and 1");
+        assert_eq!(ident.label(), "Curves");
         // Convolution kinds are GPU-only → CPU apply_linear is a pass-through no-op.
         assert_eq!(
             AdjustmentKind::BoxBlur { radius: 4.0 }.apply_linear([0.3, 0.4, 0.5]),

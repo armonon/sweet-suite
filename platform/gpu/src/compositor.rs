@@ -54,6 +54,7 @@ const ADJ_BOX_BLUR: u32 = 9;
 const ADJ_SHARPEN: u32 = 10;
 const ADJ_EDGE_DETECT: u32 = 11;
 const ADJ_GAUSSIAN: u32 = 12;
+const ADJ_CURVES: u32 = 13;
 
 /// Map an adjustment kind to the `(mode, p0, p1, p2)` passes the `ADJUST_WGSL` shader runs.
 /// Most kinds are one pass; separable Gaussian is two (H then V, with p1/p2 carrying the
@@ -84,6 +85,7 @@ pub(crate) fn adjustment_passes(kind: &AdjustmentKind) -> Vec<(u32, f32, f32, f3
             (ADJ_GAUSSIAN, *radius, 1.0, 0.0),
             (ADJ_GAUSSIAN, *radius, 0.0, 1.0),
         ],
+        AdjustmentKind::Curves { shadow, mid, high } => vec![(ADJ_CURVES, *shadow, *mid, *high)],
     }
 }
 
@@ -219,6 +221,16 @@ fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
                 hue_to_rgb(p, q, hsl.x - 1.0/3.0));
 }
 
+// 5-knot piecewise-linear tone curve: fixed (0,0)/(1,1) endpoints, interior outputs
+// s/m/h at inputs 0.25/0.5/0.75. Mirrors `AdjustmentKind::tone_curve` on the CPU.
+fn curve5(x: f32, s: f32, m: f32, h: f32) -> f32 {
+    let xc = clamp(x, 0.0, 1.0);
+    if (xc <= 0.25) { return mix(0.0, s, xc / 0.25); }
+    if (xc <= 0.5)  { return mix(s, m, (xc - 0.25) / 0.25); }
+    if (xc <= 0.75) { return mix(m, h, (xc - 0.5) / 0.25); }
+    return mix(h, 1.0, (xc - 0.75) / 0.25);
+}
+
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     var c = textureSample(src_tex, samp, in.uv);
@@ -340,6 +352,15 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
             let gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
             let mag = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
             c = vec4(vec3(mag), c.a);
+        }
+        // Curves — per-channel 5-knot tone curve (p0=shadow, p1=mid, p2=high at .25/.5/.75).
+        case 13u {
+            c = vec4(
+                curve5(c.r, params.p0, params.p1, params.p2),
+                curve5(c.g, params.p0, params.p1, params.p2),
+                curve5(c.b, params.p0, params.p1, params.p2),
+                c.a,
+            );
         }
         default {}
     }
